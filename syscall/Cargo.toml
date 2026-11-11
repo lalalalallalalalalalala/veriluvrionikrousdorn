@@ -1,12 +1,18 @@
 [package]
 name = "vlr-syscall"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
-description = "Future system-call interface"
+description = "Ring-3 syscall dispatcher"
 
 [lib]
 test = false
 bench = false
 
 [dependencies]
+vlr-arch = { path = "../arch" }
+vlr-console = { path = "../console" }
+vlr-drivers = { path = "../drivers" }
+vlr-libc = { path = "../user/vlr-libc" }
+vlr-memory = { path = "../memory" }
+vlr-sched = { path = "../sched" }

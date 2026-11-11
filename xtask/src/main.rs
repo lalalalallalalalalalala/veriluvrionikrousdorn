@@ -171,7 +171,17 @@ fn host_tests() -> Result<()> {
         "CARGO_TARGET_DIR",
         workspace_root().join("target/host-test"),
     );
-    command.args(["test", "-p", "vch", "-p", "vlr-loader", "-p", "vlr-memory"]);
+    command.args([
+        "test",
+        "-p",
+        "vch",
+        "-p",
+        "vlr-loader",
+        "-p",
+        "vlr-memory",
+        "-p",
+        "vlr-libc",
+    ]);
     let status = command.status().context("failed to spawn cargo test")?;
     if !status.success() {
         bail!("host tests failed");
@@ -222,7 +232,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.3.0",
+        "VLR kernel 0.4.0",
         "timer-ok",
         "offset-map-ok",
         "heap-large-ok",
@@ -233,6 +243,10 @@ fn boot_test() -> Result<()> {
         "sched-ok",
         "sleep-ok",
         "reap-ok",
+        "hello from ring 3",
+        "user-hello-ok",
+        "user fault",
+        "user-bad-ok",
         "exception: page fault at 0xffff820000000000",
         "page-fault-ok addr=0xffff820000000000",
         "vlr-boot-ok",
@@ -332,10 +346,20 @@ fn shell_session() -> Result<()> {
         bail!("mem output missing:\n{}", captured.lock().unwrap());
     }
 
+    writer
+        .write_all(b"run greet\r")
+        .context("write run greet")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "greet from ring 3", Duration::from_secs(8)) {
+        bail!("user greet missing:\n{}", captured.lock().unwrap());
+    }
+
     writer.write_all(b"ps\r").context("write ps")?;
     writer.flush().ok();
     if !wait_for(&captured, "ticker", Duration::from_secs(5))
         || !wait_for(&captured, "spinner", Duration::from_secs(5))
+        || !wait_for(&captured, "greet", Duration::from_secs(5))
+        || !wait_for(&captured, "user", Duration::from_secs(5))
     {
         bail!("ps output missing:\n{}", captured.lock().unwrap());
     }

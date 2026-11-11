@@ -29,6 +29,7 @@ pub struct MemorySnapshot {
 pub struct TaskSnapshot {
     pub id: u64,
     pub name: String,
+    pub mode: &'static str,
     pub state: &'static str,
     pub ticks: u64,
 }
@@ -43,6 +44,7 @@ pub trait ShellIo {
     fn tasks(&mut self) -> Vec<TaskSnapshot>;
     fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str>;
     fn kill_task(&mut self, id: u64) -> Result<(), &'static str>;
+    fn run_user(&mut self, name: &str) -> Result<u64, &'static str>;
 }
 
 pub struct ShellInfo {
@@ -151,7 +153,8 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  history  recent commands\n  \
                  ps       list tasks\n  \
                  spawn    spawn ticker or spinner\n  \
-                 kill     stop a task by id\n",
+                 kill     stop a task by id\n  \
+                 run      run hello, greet, or bad in ring 3\n",
             );
         }
         "clear" => io.clear(),
@@ -212,6 +215,16 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
             },
             None => io.write_str("kill failed\n"),
         },
+        "run" => match io.run_user(rest) {
+            Ok(id) => {
+                let line = alloc::format!("user {id}\n");
+                io.write_str(&line);
+            }
+            Err(err) => {
+                io.write_str(err);
+                io.write_str("\n");
+            }
+        },
         "history" => {
             for (index, command) in history.iter().enumerate() {
                 let line = alloc::format!("{index} {command}\n");
@@ -253,7 +266,7 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
     io.write_str(info.os_name);
     io.write_str(" (VLR) ");
     io.write_str(info.os_version);
-    io.write_str("\nx86-64 kernel, multitasking milestone\nuser: ");
+    io.write_str("\nx86-64 kernel, user mode milestone\nuser: ");
     io.write_str(info.username);
     io.write_str("\nhome: ");
     io.write_str(info.home_path);
@@ -290,9 +303,16 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
 }
 
 fn write_ps<I: ShellIo>(io: &mut I) {
-    io.write_str("id name state ticks\n");
+    io.write_str("id name mode state ticks\n");
     for task in io.tasks() {
-        let line = alloc::format!("{} {} {} {}\n", task.id, task.name, task.state, task.ticks);
+        let line = alloc::format!(
+            "{} {} {} {} {}\n",
+            task.id,
+            task.name,
+            task.mode,
+            task.state,
+            task.ticks
+        );
         io.write_str(&line);
     }
 }
@@ -372,12 +392,14 @@ mod tests {
                 TaskSnapshot {
                     id: 0,
                     name: String::from("idle"),
+                    mode: "kernel",
                     state: "running",
                     ticks: 1,
                 },
                 TaskSnapshot {
                     id: 1,
                     name: String::from("vch"),
+                    mode: "kernel",
                     state: "ready",
                     ticks: 4,
                 },
@@ -395,6 +417,13 @@ mod tests {
                 Err("kill failed")
             } else {
                 Ok(())
+            }
+        }
+        fn run_user(&mut self, name: &str) -> Result<u64, &'static str> {
+            if name == "hello" {
+                Ok(7)
+            } else {
+                Err("unknown program")
             }
         }
     }
@@ -472,8 +501,9 @@ mod tests {
         io.out.clear();
         io.out.clear();
         dispatch(&mut io, &info, "ps", &[]);
-        assert!(io.out.contains("id name state ticks"));
+        assert!(io.out.contains("id name mode state ticks"));
         assert!(io.out.contains("idle"));
+        assert!(io.out.contains("kernel"));
         assert!(io.out.contains("vch"));
 
         io.out.clear();
@@ -487,6 +517,14 @@ mod tests {
         io.out.clear();
         dispatch(&mut io, &info, "kill 5", &[]);
         assert_eq!(io.out, "killed 5\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "run hello", &[]);
+        assert_eq!(io.out, "user 7\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "run nope", &[]);
+        assert_eq!(io.out, "unknown program\n");
 
         io.out.clear();
         dispatch(&mut io, &info, "kill", &[]);

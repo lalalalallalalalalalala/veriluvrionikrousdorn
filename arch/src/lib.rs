@@ -9,6 +9,7 @@
 mod gdt;
 mod idt;
 mod pic;
+pub mod syscall_entry;
 
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -75,6 +76,51 @@ pub fn set_exception_logger(logger: fn(&str)) {
 /// Нужен загрузочному тесту: обработчик печатает адрес и завершает QEMU.
 pub fn set_page_fault_hook(hook: fn(u64) -> !) {
     idt::set_page_fault_hook(hook);
+}
+
+/// Сбой задачи кольца 3: ядро живо, задачу нужно снять.
+pub fn set_user_fault_hook(hook: fn(u64, &'static str) -> !) {
+    idt::set_user_fault_hook(hook);
+}
+
+pub fn set_syscall_handler(handler: unsafe extern "C" fn(*mut syscall_entry::SyscallFrame)) {
+    syscall_entry::set_handler(handler);
+}
+
+pub fn user_cs() -> u16 {
+    gdt::user_cs()
+}
+
+pub fn user_ss() -> u16 {
+    gdt::user_ss()
+}
+
+pub fn set_kernel_stack(top: u64) {
+    gdt::set_kernel_stack(top);
+}
+
+pub unsafe fn enter_user(rip: u64, user_rsp: u64, kernel_rsp: u64) -> ! {
+    let cs = user_cs() as u64;
+    let ss = user_ss() as u64;
+    let rflags = 0x202u64;
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {kernel_rsp}",
+            "push {ss}",
+            "push {user_rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip}",
+            "iretq",
+            kernel_rsp = in(reg) kernel_rsp,
+            ss = in(reg) ss,
+            user_rsp = in(reg) user_rsp,
+            rflags = in(reg) rflags,
+            cs = in(reg) cs,
+            rip = in(reg) rip,
+            options(noreturn),
+        );
+    }
 }
 
 pub(crate) fn log_exception(args: fmt::Arguments) {

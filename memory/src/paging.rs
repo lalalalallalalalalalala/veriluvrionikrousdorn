@@ -35,6 +35,7 @@ pub unsafe fn init(offset: u64) {
     });
     *PHYS_OFFSET.lock() = Some(offset);
     MAPPER.lock().inner = Some(mapper);
+    crate::user::capture_kernel_cr3();
 }
 
 pub fn phys_offset() -> Option<u64> {

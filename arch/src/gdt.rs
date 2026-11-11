@@ -20,11 +20,37 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 struct Selectors {
     code: SegmentSelector,
     data: SegmentSelector,
+    user_data: SegmentSelector,
+    user_code: SegmentSelector,
     tss: SegmentSelector,
+}
+
+static mut TSS_PTR: *mut TaskStateSegment = core::ptr::null_mut();
+
+pub fn user_cs() -> u16 {
+    let tables = gdt(tss());
+    tables.1.user_code.0
+}
+
+pub fn user_ss() -> u16 {
+    let tables = gdt(tss());
+    tables.1.user_data.0
+}
+
+/// Вершина стека ядра для смены привилегии (RSP0). Ноль — не трогать.
+pub fn set_kernel_stack(top: u64) {
+    unsafe {
+        if !TSS_PTR.is_null() && top != 0 {
+            (*TSS_PTR).privilege_stack_table[0] = VirtAddr::new(top);
+        }
+    }
 }
 
 pub fn init() {
     let tss = tss();
+    unsafe {
+        TSS_PTR = tss as *const TaskStateSegment as *mut TaskStateSegment;
+    }
     let tables = gdt(tss);
     tables.0.load();
     unsafe {
@@ -49,12 +75,18 @@ fn gdt(tss: &'static TaskStateSegment) -> &'static (GlobalDescriptorTable, Selec
         let mut gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
         let data = gdt.append(Descriptor::kernel_data_segment());
+        // Порядок важен для iretq: данные пользователя сразу после данных ядра,
+        // код пользователя следом. Селекторы получают RPL 3 из DPL дескриптора.
+        let user_data = gdt.append(Descriptor::user_data_segment());
+        let user_code = gdt.append(Descriptor::user_code_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(tss));
         (
             gdt,
             Selectors {
                 code,
                 data,
+                user_data,
+                user_code,
                 tss: tss_selector,
             },
         )

@@ -1,14 +1,32 @@
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::PrivilegeLevel;
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 static PAGE_FAULT_HOOK: Mutex<Option<fn(u64) -> !>> = Mutex::new(None);
+static USER_FAULT_HOOK: Mutex<Option<fn(u64, &'static str) -> !>> = Mutex::new(None);
 
 pub fn set_page_fault_hook(hook: fn(u64) -> !) {
     *PAGE_FAULT_HOOK.lock() = Some(hook);
+}
+
+pub fn set_user_fault_hook(hook: fn(u64, &'static str) -> !) {
+    *USER_FAULT_HOOK.lock() = Some(hook);
+}
+
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
+fn user_fault(addr: u64, kind: &'static str) -> ! {
+    let hook = *USER_FAULT_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(addr, kind);
+    }
+    crate::hlt_loop();
 }
 
 pub fn init() {
@@ -27,6 +45,12 @@ fn idt() -> &'static InterruptDescriptorTable {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(crate::syscall_entry::handler_addr())
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt[32].set_handler_fn(irq0);
         idt[33].set_handler_fn(irq1);
         idt[34].set_handler_fn(irq2);
@@ -56,6 +80,9 @@ extern "x86-interrupt" fn page_fault_handler(
     error: PageFaultErrorCode,
 ) {
     let address = Cr2::read_raw();
+    if from_user(&frame) {
+        user_fault(address, "page-fault");
+    }
     crate::log_exception(format_args!(
         "exception: page fault at {address:#x} error={error:?}\n{frame:?}\n"
     ));
@@ -66,7 +93,18 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        user_fault(frame.instruction_pointer.as_u64(), "invalid-opcode");
+    }
+    crate::log_exception(format_args!("exception: invalid opcode\n{frame:?}\n"));
+    crate::hlt_loop();
+}
+
 extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame, error: u64) {
+    if from_user(&frame) {
+        user_fault(frame.instruction_pointer.as_u64(), "general-protection");
+    }
     crate::log_exception(format_args!(
         "exception: general protection error={error:#x}\n{frame:?}\n"
     ));

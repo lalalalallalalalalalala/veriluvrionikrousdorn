@@ -1,0 +1,8 @@
+[package]
+name = "vlr-libc"
+version = "0.4.0"
+edition = "2021"
+publish = false
+description = "Userspace syscall wrappers for future .vlr programs"
+
+[dependencies]

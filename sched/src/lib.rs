@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::instructions::interrupts;
 
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 32;
 const STACK_SIZE: usize = 64 * 1024;
 const NAME_CAP: usize = 16;
 
@@ -42,6 +42,9 @@ struct Task {
     stack: *mut u8,
     stack_layout: Option<Layout>,
     rsp: u64,
+    kstack_top: u64,
+    cr3: u64,
+    user: bool,
 }
 
 impl Task {
@@ -57,6 +60,9 @@ impl Task {
             stack: core::ptr::null_mut(),
             stack_layout: None,
             rsp: 0,
+            kstack_top: 0,
+            cr3: 0,
+            user: false,
         }
     }
 }
@@ -90,6 +96,7 @@ pub struct TaskInfo {
     pub id: u64,
     pub name: [u8; NAME_CAP],
     pub name_len: u8,
+    pub mode: &'static str,
     pub state: &'static str,
     pub ticks: u64,
 }
@@ -100,6 +107,7 @@ impl TaskInfo {
             id: 0,
             name: [0; NAME_CAP],
             name_len: 0,
+            mode: "",
             state: "",
             ticks: 0,
         }
@@ -148,6 +156,9 @@ pub fn init() {
             stack: core::ptr::null_mut(),
             stack_layout: None,
             rsp: 0,
+            kstack_top: 0,
+            cr3: 0,
+            user: false,
         };
         table.current = 0;
         table.next_id = 1;
@@ -227,6 +238,29 @@ pub fn exists(name: &str) -> bool {
     })
 }
 
+pub fn current_id() -> u64 {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        table.tasks[table.current].id
+    })
+}
+
+pub fn kernel_stack_top() -> u64 {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        table.tasks[table.current].kstack_top
+    })
+}
+
+pub fn become_user(cr3: u64) {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let current = table.current;
+        table.tasks[current].cr3 = cr3;
+        table.tasks[current].user = true;
+    });
+}
+
 pub fn snapshot(out: &mut [TaskInfo]) -> usize {
     interrupts::without_interrupts(|| unsafe {
         let table = table();
@@ -242,6 +276,7 @@ pub fn snapshot(out: &mut [TaskInfo]) -> usize {
                 id: task.id,
                 name: task.name,
                 name_len: task.name_len,
+                mode: if task.user { "user" } else { "kernel" },
                 state: state_name(task.state),
                 ticks: task.ticks,
             };
@@ -321,6 +356,8 @@ unsafe fn spawn_locked(name: &str, entry: fn()) -> Result<TaskId, SchedError> {
     task.stack = stack;
     task.stack_layout = Some(layout);
     task.rsp = prepare_stack(stack, STACK_SIZE);
+    let limit = stack as usize + STACK_SIZE;
+    task.kstack_top = (limit & !15) as u64;
     table.tasks[index] = task;
     Ok(TaskId(id))
 }
@@ -365,8 +402,12 @@ unsafe fn schedule(table: &mut Table) {
         return;
     }
     table.current = next;
+    let cr3 = table.tasks[next].cr3;
+    let kstack = table.tasks[next].kstack_top;
     let old_rsp = core::ptr::addr_of_mut!(table.tasks[current].rsp);
     let new_rsp = core::ptr::addr_of!(table.tasks[next].rsp);
+    vlr_memory::activate_cr3(cr3);
+    vlr_arch::set_kernel_stack(kstack);
     unsafe {
         context_switch(old_rsp, new_rsp);
     }
@@ -399,7 +440,11 @@ fn reap(table: &mut Table) {
         }
         let stack = table.tasks[index].stack;
         let layout = table.tasks[index].stack_layout;
+        let cr3 = table.tasks[index].cr3;
         table.tasks[index] = Task::empty();
+        if cr3 != 0 {
+            vlr_memory::free_user_space(cr3);
+        }
         if let Some(layout) = layout {
             if !stack.is_null() {
                 unsafe { alloc::alloc::dealloc(stack, layout) };

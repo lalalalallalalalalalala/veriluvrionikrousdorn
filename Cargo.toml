@@ -12,6 +12,7 @@ members = [
     "btrfs",
     "loader",
     "vch",
+    "user/vlr-libc",
     "xtask",
 ]
 default-members = ["xtask"]

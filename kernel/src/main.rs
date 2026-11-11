@@ -12,6 +12,8 @@ use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use vlr_drivers::display::FramebufferConfig;
 use vlr_memory::RegionRecord;
 
+mod userland;
+
 const OS_NAME: &str = "Veriluvrionikrousdorn";
 const OS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -85,6 +87,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     vlr_drivers::serial::write_str("diag: heap ok\n");
 
     vlr_sched::init();
+    vlr_arch::set_user_fault_hook(on_user_fault);
     vlr_drivers::timer::init();
     vlr_drivers::keyboard::init();
     vlr_drivers::serial::enable_rx_irq();
@@ -151,6 +154,7 @@ fn boot_test() -> ! {
     heap_checks();
     paging_checks();
     sched_checks();
+    user_checks();
 
     const FAULT_ADDR: u64 = 0xFFFF_8200_0000_0000;
     vlr_arch::set_page_fault_hook(on_test_fault);
@@ -308,6 +312,39 @@ fn sched_checks() {
 }
 
 #[cfg(feature = "boot-test")]
+fn user_checks() {
+    if vlr_sched::spawn("hello", userland::launch_hello).is_err() {
+        fail("user-spawn-bad");
+    }
+    let start = vlr_drivers::timer::ticks();
+    while vlr_sched::exists("hello") {
+        if vlr_drivers::timer::ticks().saturating_sub(start) > 300 {
+            fail("user-hello-timeout");
+        }
+        core::hint::spin_loop();
+    }
+    vlr_console::println!("user-hello-ok");
+
+    if vlr_sched::spawn("bad", userland::launch_bad).is_err() {
+        fail("user-bad-spawn");
+    }
+    let start = vlr_drivers::timer::ticks();
+    while vlr_sched::exists("bad") {
+        if vlr_drivers::timer::ticks().saturating_sub(start) > 300 {
+            fail("user-bad-timeout");
+        }
+        core::hint::spin_loop();
+    }
+    vlr_console::println!("user-bad-ok");
+}
+
+fn on_user_fault(addr: u64, kind: &'static str) -> ! {
+    let id = vlr_sched::current_id();
+    vlr_console::println!("user fault: {kind} pid={id} addr={addr:#x}");
+    vlr_sched::exit();
+}
+
+#[cfg(feature = "boot-test")]
 fn on_test_fault(addr: u64) -> ! {
     vlr_console::println!("page-fault-ok addr={addr:#x}");
     vlr_console::println!("vlr-boot-ok");
@@ -412,6 +449,7 @@ impl vch::ShellIo for KernelShell {
                 name: core::str::from_utf8(&task.name[..task.name_len as usize])
                     .unwrap_or("?")
                     .into(),
+                mode: task.mode,
                 state: task.state,
                 ticks: task.ticks,
             })
@@ -424,6 +462,10 @@ impl vch::ShellIo for KernelShell {
 
     fn kill_task(&mut self, id: u64) -> Result<(), &'static str> {
         vlr_sched::kill(id).map_err(|_| "kill failed")
+    }
+
+    fn run_user(&mut self, name: &str) -> Result<u64, &'static str> {
+        userland::launch_named(name)
     }
 }
 

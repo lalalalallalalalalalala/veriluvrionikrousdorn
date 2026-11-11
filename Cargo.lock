@@ -147,7 +147,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "kernel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bootloader_api",
  "vch",
@@ -429,6 +429,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vlr-libc"
+version = "0.4.0"
+
+[[package]]
 name = "vlr-loader"
 version = "0.1.0"
 
@@ -446,12 +450,21 @@ name = "vlr-sched"
 version = "0.3.0"
 dependencies = [
  "vlr-arch",
+ "vlr-memory",
  "x86_64",
 ]
 
 [[package]]
 name = "vlr-syscall"
-version = "0.1.0"
+version = "0.4.0"
+dependencies = [
+ "vlr-arch",
+ "vlr-console",
+ "vlr-drivers",
+ "vlr-libc",
+ "vlr-memory",
+ "vlr-sched",
+]
 
 [[package]]
 name = "vlr-vfs"
