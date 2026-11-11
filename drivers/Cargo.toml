@@ -1,0 +1,15 @@
+[package]
+name = "vlr-drivers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Hardware drivers for Veriluvrionikrousdorn"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+vlr-arch = { path = "../arch" }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

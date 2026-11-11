@@ -1,0 +1,14 @@
+[package]
+name = "vlr-arch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "x86-64 CPU setup for Veriluvrionikrousdorn: GDT, IDT, PIC, exceptions"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex", "once"] }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

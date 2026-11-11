@@ -1,0 +1,8 @@
+[package]
+name = "vch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-kernel vch shell, later the first .vlr userspace application"
+
+[dependencies]

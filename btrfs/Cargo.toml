@@ -1,0 +1,14 @@
+[package]
+name = "vlr-btrfs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Btrfs filesystem (planned; not implemented this milestone)"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vlr-drivers = { path = "../drivers" }
+vlr-vfs = { path = "../vfs" }

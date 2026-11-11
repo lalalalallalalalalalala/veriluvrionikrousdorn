@@ -1,0 +1,8 @@
+[package]
+name = "vlr-loader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Draft .vlr header, application paths, and the future executable loader"
+
+[dependencies]

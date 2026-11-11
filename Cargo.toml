@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "arch",
+    "drivers",
+    "console",
+    "memory",
+    "sched",
+    "syscall",
+    "vfs",
+    "btrfs",
+    "loader",
+    "vch",
+    "xtask",
+]
+default-members = ["xtask"]
+
+# The kernel target has no unwinder. Abort keeps every crate, including the
+# host-side image builder, on the same panic strategy.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

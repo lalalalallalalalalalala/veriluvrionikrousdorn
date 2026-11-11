@@ -1,0 +1,12 @@
+[package]
+name = "vlr-sched"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Future task scheduler"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]

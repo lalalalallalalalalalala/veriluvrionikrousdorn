@@ -1,0 +1,13 @@
+[package]
+name = "vlr-console"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Kernel console: framebuffer text plus serial log"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vlr-drivers = { path = "../drivers" }

@@ -1,0 +1,13 @@
+[package]
+name = "vlr-memory"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Physical memory map and future frame/heap interfaces"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["once"] }

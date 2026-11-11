@@ -1,0 +1,13 @@
+[package]
+name = "vlr-vfs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Virtual filesystem interface"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vlr-drivers = { path = "../drivers" }
