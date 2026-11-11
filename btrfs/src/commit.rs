@@ -65,6 +65,7 @@ pub(crate) struct Tx {
     free: Vec<(u64, u64)>,
     info: Vec<(u64, Vec<u8>)>,
     pub(crate) dirty: bool,
+    trusted: bool,
     csum_dirty: bool,
     data_delta: i64,
     /// Данные, которые нужно записать в новый экстент перед суперблоком.
@@ -80,11 +81,42 @@ struct Payload {
     disk_len: u64,
 }
 
+struct Session {
+    buf: [u8; 24],
+    len: u8,
+}
+
+impl Session {
+    const fn empty() -> Self {
+        Self { buf: [0; 24], len: 0 }
+    }
+}
+
+static SESSION: spin::Mutex<Session> = spin::Mutex::new(Session::empty());
+
+pub fn set_session(name: &str) {
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(24);
+    let mut slot = SESSION.lock();
+    slot.buf[..n].copy_from_slice(&bytes[..n]);
+    slot.len = n as u8;
+}
+
+pub fn session_name() -> alloc::string::String {
+    let slot = SESSION.lock();
+    if slot.len == 0 {
+        alloc::string::String::from("user")
+    } else {
+        alloc::string::String::from(core::str::from_utf8(&slot.buf[..slot.len as usize]).unwrap_or("user"))
+    }
+}
+
 pub fn may_write(path: &str) -> bool {
     let path = path.trim_end_matches('/');
-    path == "/Users/user"
-        || path.starts_with("/Users/user/")
-        || (path.starts_with("/AppData/") && path != "/AppData")
+    let name = session_name();
+    let home = alloc::format!("/Users/{name}");
+    let nested = alloc::format!("{home}/");
+    path == home || path.starts_with(&nested) || (path.starts_with("/AppData/") && path != "/AppData")
 }
 
 pub(crate) fn open(vol: &Volume, disk: &mut dyn BlockDevice) -> Result<Tx, BtrfsError> {
@@ -138,6 +170,7 @@ pub(crate) fn open(vol: &Volume, disk: &mut dyn BlockDevice) -> Result<Tx, Btrfs
         free,
         info,
         dirty: false,
+        trusted: false,
         csum_dirty: false,
         data_delta: 0,
         payload: None,
@@ -359,8 +392,12 @@ impl Tx {
         Ok(new_fs)
     }
 
+    pub(crate) fn elevate(&mut self) {
+        self.trusted = true;
+    }
+
     fn ensure(&self, path: &str) -> Result<(), BtrfsError> {
-        if may_write(path) {
+        if self.trusted || may_write(path) {
             Ok(())
         } else {
             Err(BtrfsError::ReadOnly)

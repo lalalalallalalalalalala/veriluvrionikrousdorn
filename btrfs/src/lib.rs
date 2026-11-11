@@ -462,6 +462,7 @@ pub fn list_inode(inode: u64) -> Result<Vec<alloc::string::String>, BtrfsError> 
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn apply<R>(
     vol: &mut Volume,
     disk: &mut dyn BlockDevice,
@@ -496,6 +497,37 @@ fn mutate<R>(
 
 pub fn may_write(path: &str) -> bool {
     commit::may_write(path)
+}
+
+pub fn set_session(name: &str) {
+    commit::set_session(name);
+}
+
+pub fn session_name() -> alloc::string::String {
+    commit::session_name()
+}
+
+pub fn system_mkdir(path: &str) -> Result<(), BtrfsError> {
+    if !(path.starts_with("/System") || path.starts_with("/Users")) {
+        return Err(BtrfsError::ReadOnly);
+    }
+    mutate(|tx, _, _| {
+        tx.elevate();
+        match tx.mkdir(path) {
+            Err(BtrfsError::Exists) => Ok(()),
+            other => other,
+        }
+    })
+}
+
+pub fn system_write(path: &str, data: &[u8]) -> Result<(), BtrfsError> {
+    if !(path.starts_with("/System/") || path.starts_with("/Users/")) {
+        return Err(BtrfsError::ReadOnly);
+    }
+    mutate(|tx, vol, disk| {
+        tx.elevate();
+        tx.write_path(vol, disk, path, data, false)
+    })
 }
 
 pub fn create_file(path: &str) -> Result<(), BtrfsError> {

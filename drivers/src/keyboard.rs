@@ -20,7 +20,8 @@ fn on_irq() {
     unsafe {
         let mut status = Port::<u8>::new(0x64);
         let mut data = Port::<u8>::new(0x60);
-        if status.read() & 0x01 == 0 {
+        let status = status.read();
+        if status & 0x01 == 0 || status & 0x20 != 0 {
             return;
         }
         handle_scancode(data.read());

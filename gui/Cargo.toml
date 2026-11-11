@@ -1,0 +1,18 @@
+[package]
+name = "vlr-gui"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "Framebuffer desktop for Veriluvrionikrousdorn"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+vlr-arch = { path = "../arch" }
+vlr-console = { path = "../console" }
+vlr-drivers = { path = "../drivers" }
+vlr-loader = { path = "../loader" }
+vlr-vfs = { path = "../vfs" }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

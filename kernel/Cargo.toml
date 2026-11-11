@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 publish = false
 description = "Veriluvrionikrousdorn kernel"
@@ -8,7 +8,7 @@ description = "Veriluvrionikrousdorn kernel"
 [features]
 default = ["shell"]
 # In-kernel vch. The headless boot test builds without this feature.
-shell = ["dep:vch"]
+shell = ["dep:vch", "dep:vlr-gui", "dep:vlr-account"]
 # Headless boot check: wait for the timer, print a marker, exit QEMU.
 boot-test = []
 
@@ -19,10 +19,12 @@ bench = false
 
 [dependencies]
 bootloader_api = "0.11.17"
+vlr-account = { path = "../account", optional = true }
 vlr-arch = { path = "../arch" }
 vlr-btrfs = { path = "../btrfs" }
 vlr-console = { path = "../console" }
 vlr-drivers = { path = "../drivers" }
+vlr-gui = { path = "../gui", optional = true }
 vlr-loader = { path = "../loader" }
 vlr-memory = { path = "../memory" }
 vlr-sched = { path = "../sched" }

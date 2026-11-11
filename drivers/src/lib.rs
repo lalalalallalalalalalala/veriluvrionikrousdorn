@@ -10,6 +10,8 @@ pub mod block;
 pub mod display;
 pub mod input;
 pub mod keyboard;
+pub mod mouse;
+pub mod rtc;
 pub mod serial;
 pub mod timer;
 

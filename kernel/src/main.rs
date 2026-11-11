@@ -14,6 +14,9 @@ use vlr_memory::RegionRecord;
 
 mod userland;
 
+#[cfg(feature = "shell")]
+mod session;
+
 const OS_NAME: &str = "Veriluvrionikrousdorn";
 const OS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -101,10 +104,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     USABLE_MEMORY.store(memory.usable_bytes(), core::sync::atomic::Ordering::Relaxed);
     print_banner(memory.usable_bytes());
 
-    #[cfg(all(feature = "shell", not(feature = "boot-test")))]
-    start_shell();
-
     vlr_arch::enable_interrupts();
+
+    #[cfg(all(feature = "shell", not(feature = "boot-test")))]
+    bring_up_desktop();
 
     #[cfg(feature = "boot-test")]
     boot_test();
@@ -411,6 +414,23 @@ fn log_exception(message: &str) {
 }
 
 #[cfg(all(feature = "shell", not(feature = "boot-test")))]
+fn bring_up_desktop() {
+    let name = session::establish();
+    vlr_drivers::mouse::init();
+    if vlr_drivers::display::is_ready() {
+        vlr_gui::set_user(&name);
+        vlr_drivers::serial::write_str("gui-ok\n");
+        let _ = vlr_sched::spawn("gui", gui_task);
+    }
+    start_shell();
+}
+
+#[cfg(all(feature = "shell", not(feature = "boot-test")))]
+fn gui_task() {
+    vlr_gui::desktop();
+}
+
+#[cfg(all(feature = "shell", not(feature = "boot-test")))]
 fn start_shell() {
     let _ = vlr_sched::spawn("ticker", ticker_task);
     let _ = vlr_sched::spawn("spinner", spinner_task);
@@ -425,18 +445,25 @@ fn start_shell() {
 
 #[cfg(feature = "shell")]
 fn vch_task() {
+    let name = leak_str(vlr_btrfs::session_name());
+    let home = leak_str(vlr_account::home_of(name));
     let info = vch::ShellInfo {
-        username: vlr_loader::PLACEHOLDER_USER,
+        username: name,
         os_name: OS_NAME,
         os_version: OS_VERSION,
         usable_memory: USABLE_MEMORY.load(core::sync::atomic::Ordering::Relaxed),
         home_display: vlr_loader::HOME_DISPLAY,
-        home_path: vlr_loader::HOME_PATH,
+        home_path: home,
     };
     let mut shell = KernelShell {
-        cwd: alloc::string::String::from(vlr_loader::HOME_PATH),
+        cwd: alloc::string::String::from(home),
     };
     vch::run(&mut shell, &info);
+}
+
+#[cfg(feature = "shell")]
+fn leak_str(text: alloc::string::String) -> &'static str {
+    alloc::boxed::Box::leak(text.into_boxed_str())
 }
 
 #[cfg(feature = "shell")]

@@ -53,6 +53,7 @@ fn run() -> Result<()> {
         }
         "test" => {
             host_tests()?;
+            account_test()?;
             persist_test()?;
             boot_test()?;
             shell_test()?;
@@ -192,6 +193,8 @@ fn host_tests() -> Result<()> {
     command.args([
         "test",
         "-p",
+        "vlr-account",
+        "-p",
         "vch",
         "-p",
         "vlr-loader",
@@ -262,7 +265,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.6.0",
+        "VLR kernel 1.0.0",
         "btrfs-ok",
         "motd-ok",
         "apps-ok",
@@ -456,6 +459,9 @@ fn shell_session() -> Result<()> {
         }
     });
 
+    if !wait_for(&captured, "gui-ok", Duration::from_secs(30)) {
+        bail!("gui did not start:\n{}", captured.lock().unwrap());
+    }
     if !wait_for(&captured, "user@::vch#~ ", Duration::from_secs(30)) {
         bail!("prompt did not appear:\n{}", captured.lock().unwrap());
     }
@@ -569,6 +575,90 @@ fn build_userspace() -> Result<()> {
 }
 
 fn make_filesystem() -> Result<()> {
+    make_fs(true)
+}
+
+fn account_test() -> Result<()> {
+    build_userspace()?;
+    make_fs(false)?;
+    build_kernel(false)?;
+    make_image()?;
+    let image = workspace_root().join("target/vlr-btrfs-newuser.img");
+    fs::copy(disk_path(), &image)?;
+    drive_account(&image, true)?;
+    drive_account(&image, false)?;
+    println!("account test passed");
+    Ok(())
+}
+
+fn drive_account(disk: &std::path::Path, first: bool) -> Result<()> {
+    let serial_port = 18773u16;
+    let monitor_port = 18774u16;
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-machine", "pc", "-accel", "tcg", "-cpu", "qemu64", "-smp", "1", "-m", "256M",
+            "-display", "none", "-no-reboot",
+        ])
+        .arg("-drive")
+        .arg(format!("format=raw,if=ide,index=0,file={}", image_path().display()))
+        .arg("-drive")
+        .arg(format!("format=raw,if=ide,index=1,cache=writethrough,file={}", disk.display()))
+        .arg("-serial")
+        .arg(format!("tcp:127.0.0.1:{serial_port},server"))
+        .arg("-monitor")
+        .arg(format!("tcp:127.0.0.1:{monitor_port},server,nowait"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("account qemu")?;
+    let result = (|| {
+        let serial = connect_retry(("127.0.0.1", serial_port), Duration::from_secs(20))?;
+        let mut writer = serial.try_clone()?;
+        let captured = Arc::new(Mutex::new(String::new()));
+        let reader = Arc::clone(&captured);
+        thread::spawn(move || {
+            let mut serial = serial;
+            let mut buf = [0u8; 256];
+            loop {
+                match serial.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader.lock().expect("serial").push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        if first {
+            if !wait_for(&captured, "name:", Duration::from_secs(30)) {
+                bail!("first boot did not ask for a name:\n{}", captured.lock().unwrap());
+            }
+            writer.write_all(b"nia\rpitaya\rpitaya\r")?;
+            writer.flush().ok();
+        } else if !wait_for(&captured, "password:", Duration::from_secs(30)) {
+            bail!("login did not ask for the password:\n{}", captured.lock().unwrap());
+        } else {
+            writer.write_all(b"pitaya\r")?;
+            writer.flush().ok();
+        }
+        if !wait_for(&captured, "nia@::vch#~ ", Duration::from_secs(30)) {
+            bail!("session prompt missing:\n{}", captured.lock().unwrap());
+        }
+        if !wait_for(&captured, "gui-ok", Duration::from_secs(10)) {
+            bail!("gui missing after login:\n{}", captured.lock().unwrap());
+        }
+        Ok(())
+    })();
+    if let Ok(mut monitor) = connect_retry(("127.0.0.1", monitor_port), Duration::from_secs(3)) {
+        let _ = write!(monitor, "quit\n");
+        let _ = monitor.flush();
+        let _ = child.wait();
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn make_fs(seed_account: bool) -> Result<()> {
     let root = workspace_root().join("target/disk-root");
     if root.exists() {
         fs::remove_dir_all(&root)?;
@@ -596,6 +686,13 @@ fn make_filesystem() -> Result<()> {
     fs::write(root.join("AppData/vch/config/.keep"), b"")?;
     fs::write(root.join("AppData/vch/data/.keep"), b"")?;
     fs::write(root.join("AppData/vch/cache/.keep"), b"")?;
+    if seed_account {
+        fs::create_dir_all(root.join("System"))?;
+        fs::write(
+            root.join("System/account"),
+            b"name=user\nsalt=766c720000000000\nhash=-\n",
+        )?;
+    }
     let image = disk_path();
     if image.exists() {
         fs::remove_file(&image)?;

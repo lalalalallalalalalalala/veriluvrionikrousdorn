@@ -3,9 +3,18 @@
 //! Драйвер не зависит от `bootloader_api`: ядро передаёт уже разобранное
 //! описание буфера. Символы рисуются шрифтом 8x8 с масштабом 2.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use spin::Mutex;
 
 use crate::font::FONT8X8;
+
+static TEXT_ON: AtomicBool = AtomicBool::new(true);
+
+/// Когда рабочий стол рисует сам, текстовая консоль не затирает кадр.
+pub fn set_text_enabled(enabled: bool) {
+    TEXT_ON.store(enabled, Ordering::Relaxed);
+}
 
 const SCALE: usize = 2;
 const FONT_W: usize = 8;
@@ -92,6 +101,9 @@ pub fn clear() {
 }
 
 pub fn write_str(text: &str) {
+    if !TEXT_ON.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(display) = DISPLAY.lock().as_mut() {
         for byte in text.bytes() {
             display.write_byte(byte);
@@ -106,6 +118,43 @@ pub fn write_byte(byte: u8) {
 }
 
 /// Не блокироваться, если консоль уже занята (обработчик паники).
+pub fn size() -> Option<(usize, usize)> {
+    DISPLAY.lock().as_ref().map(|display| (display.width, display.height))
+}
+
+pub fn fill_rect(x: usize, y: usize, w: usize, h: usize, rgb: u32) {
+    if let Some(display) = DISPLAY.lock().as_mut() {
+        display.fill_rect(x, y, w, h, rgb);
+    }
+}
+
+pub fn blit_rgb(x: usize, y: usize, w: usize, h: usize, rgb: &[u8]) {
+    if let Some(display) = DISPLAY.lock().as_mut() {
+        display.blit_rgb(x, y, w, h, rgb);
+    }
+}
+
+pub fn blit_solid(x: usize, y: usize, w: usize, h: usize, pixels: &[u32], scale: usize) {
+    if let Some(display) = DISPLAY.lock().as_mut() {
+        let scale = scale.max(1);
+        for row in 0..h {
+            for col in 0..w {
+                let color = pixels.get(row * w + col).copied().unwrap_or(0);
+                if color == 0 {
+                    continue;
+                }
+                display.fill_rect(x + col * scale, y + row * scale, scale, scale, color);
+            }
+        }
+    }
+}
+
+pub fn glyph(x: usize, y: usize, ch: u8, fg: u32, bg: u32, scale: usize) {
+    if let Some(display) = DISPLAY.lock().as_mut() {
+        display.glyph(x, y, ch, fg, bg, scale.max(1));
+    }
+}
+
 pub fn try_write_str(text: &str) -> bool {
     let Some(mut guard) = DISPLAY.try_lock() else {
         return false;
@@ -206,6 +255,47 @@ impl Display {
                 for dy in 0..SCALE {
                     for dx in 0..SCALE {
                         self.put_pixel(px + dx, py + dy, color);
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
+        for row in y..y.saturating_add(h).min(self.height) {
+            for col in x..x.saturating_add(w).min(self.width) {
+                self.put_pixel(col, row, rgb);
+            }
+        }
+    }
+
+    fn blit_rgb(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: &[u8]) {
+        for row in 0..h {
+            for col in 0..w {
+                let i = (row * w + col) * 3;
+                if i + 2 >= rgb.len() {
+                    return;
+                }
+                let color = ((rgb[i] as u32) << 16) | ((rgb[i + 1] as u32) << 8) | rgb[i + 2] as u32;
+                self.put_pixel(x + col, y + row, color);
+            }
+        }
+    }
+
+    fn glyph(&mut self, x: usize, y: usize, ch: u8, fg: u32, bg: u32, scale: usize) {
+        let glyph = FONT8X8[ch.min(127) as usize];
+        for gy in 0..FONT_H {
+            let bits = glyph[gy];
+            for gx in 0..FONT_W {
+                let on = bits & (1 << gx) != 0;
+                let color = if on { fg } else { bg };
+                let px = x + gx * scale;
+                let py = y + gy * scale;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        if color != 0 || bg != 0 {
+                            self.put_pixel(px + dx, py + dy, color);
+                        }
                     }
                 }
             }

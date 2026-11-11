@@ -14,7 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use vlr_arch::syscall_entry::SyscallFrame;
 use vlr_libc::{
     FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_GETPID, SYS_GETTICKS, SYS_KILL,
-    SYS_FSYNC, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_READDIR, SYS_RENAME,
+    SYS_FSYNC, SYS_GETUSER, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_READDIR,
+    SYS_RENAME,
     SYS_SLEEP, SYS_TASKSTAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SYS_YIELD, O_APPEND, O_CREAT, O_RDWR,
     O_TRUNC, O_WRONLY, TaskRec, TwoPaths,
 };
@@ -88,6 +89,7 @@ fn dispatch(number: u64, a: u64, b: u64, c: u64) -> u64 {
         SYS_UNLINK => sys_path(a, b, vlr_btrfs::remove_path),
         SYS_RENAME => sys_rename(a),
         SYS_FSYNC => 0,
+        SYS_GETUSER => sys_getuser(a, b),
         _ => FAULT,
     }
 }
@@ -234,6 +236,19 @@ fn sys_write_file(fd: u64, ptr: u64, len: u64) -> u64 {
         vlr_sched::fd_advance(fd, meta.pos + len as u64);
     }
     len as u64
+}
+
+fn sys_getuser(ptr: u64, len: u64) -> u64 {
+    let name = vlr_btrfs::session_name();
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(len as usize);
+    if n == 0 || !vlr_memory::is_user_range(ptr, n) {
+        return FAULT;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, n);
+    }
+    n as u64
 }
 
 fn sys_path(ptr: u64, len: u64, op: fn(&str) -> Result<(), vlr_btrfs::BtrfsError>) -> u64 {

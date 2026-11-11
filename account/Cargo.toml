@@ -1,0 +1,10 @@
+[package]
+name = "vlr-account"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "The single Veriluvrionikrousdorn account"
+
+[dependencies]
+
+[dev-dependencies]

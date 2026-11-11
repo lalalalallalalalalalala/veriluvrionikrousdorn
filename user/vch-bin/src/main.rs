@@ -7,8 +7,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use vch::{MemorySnapshot, ShellInfo, ShellIo, TaskSnapshot};
 use vlr_libc::{
-    close, exec, fsync, getticks, kill, kspawn, memstat, mkdir, open, open_flags, read, readdir,
-    rename, taskstat, unlink, write, MemInfo, TaskRec, FD_STDOUT, O_CREAT, O_RDWR, O_TRUNC,
+    close, exec, fsync, getticks, getuser, kill, kspawn, memstat, mkdir, open, open_flags, read,
+    readdir, rename, taskstat, unlink, write, MemInfo, TaskRec, FD_STDOUT, O_CREAT, O_RDWR,
+    O_TRUNC,
 };
 
 struct SysIo {
@@ -17,16 +18,22 @@ struct SysIo {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    let mut raw = [0u8; 24];
+    let n = getuser(&mut raw).max(0) as usize;
+    let name = core::str::from_utf8(&raw[..n.min(raw.len())]).unwrap_or("user");
+    let name: &'static str = alloc::boxed::Box::leak(String::from(name).into_boxed_str());
+    let home = alloc::format!("/Users/{name}");
+    let home: &'static str = alloc::boxed::Box::leak(home.into_boxed_str());
     let info = ShellInfo {
-        username: "user",
+        username: name,
         os_name: "Veriluvrionikrousdorn",
-        os_version: "0.6.0",
+        os_version: "1.0.0",
         usable_memory: 0,
         home_display: "~",
-        home_path: "/Users/user",
+        home_path: home,
     };
     let mut io = SysIo {
-        cwd: String::from("/Users/user"),
+        cwd: String::from(home),
     };
     vch::run(&mut io, &info);
 }

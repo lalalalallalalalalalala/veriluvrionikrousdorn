@@ -26,6 +26,7 @@ pub const SYS_MKDIR: u64 = 17;
 pub const SYS_UNLINK: u64 = 18;
 pub const SYS_RENAME: u64 = 19;
 pub const SYS_FSYNC: u64 = 20;
+pub const SYS_GETUSER: u64 = 21;
 
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
@@ -150,6 +151,10 @@ pub fn fsync(fd: u64) -> i64 {
     syscall1(SYS_FSYNC, fd) as i64
 }
 
+pub fn getuser(buf: &mut [u8]) -> i64 {
+    syscall3(SYS_GETUSER, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
+}
+
 pub fn close(fd: u64) -> i64 {
     syscall1(SYS_CLOSE, fd) as i64
 }
@@ -259,6 +264,7 @@ mod tests {
             SYS_UNLINK,
             SYS_RENAME,
             SYS_FSYNC,
+            SYS_GETUSER,
         ];
         for (index, number) in nums.iter().enumerate() {
             assert_eq!(*number, (index as u64) + 1);
