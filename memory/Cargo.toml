@@ -1,13 +1,11 @@
 [package]
 name = "vlr-memory"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
-description = "Physical memory map and future frame/heap interfaces"
-
-[lib]
-test = false
-bench = false
+description = "Physical frame allocator, paging, and the kernel heap"
 
 [dependencies]
-spin = { version = "0.9.8", default-features = false, features = ["once"] }
+linked_list_allocator = { version = "0.10", default-features = false }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex", "once"] }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

@@ -56,6 +56,12 @@ pub fn set_exception_logger(logger: fn(&str)) {
     *LOGGER.lock() = Some(logger);
 }
 
+/// После сообщения о page fault вызвать этот хук вместо остановки.
+/// Нужен загрузочному тесту: обработчик печатает адрес и завершает QEMU.
+pub fn set_page_fault_hook(hook: fn(u64) -> !) {
+    idt::set_page_fault_hook(hook);
+}
+
 pub(crate) fn log_exception(args: fmt::Arguments) {
     let mut raw = [0u8; 384];
     let used = {

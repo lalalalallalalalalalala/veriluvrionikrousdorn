@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{MemoryRegionKind, PixelFormat};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -19,6 +21,9 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: vlr_memory::KernelAllocator = vlr_memory::KernelAllocator::new();
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -67,6 +72,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     vlr_arch::set_exception_logger(log_exception);
     vlr_arch::init();
     vlr_drivers::serial::write_str("diag: arch ok\n");
+
+    let offset = physical_offset.expect("bootloader did not map physical memory");
+    unsafe { vlr_memory::init_paging(offset) };
+    if let Err(err) = vlr_memory::init_heap() {
+        vlr_drivers::serial::write_str("diag: heap failed\n");
+        let _ = err;
+        vlr_arch::debug_exit(false);
+    }
+    vlr_drivers::serial::write_str("diag: heap ok\n");
 
     vlr_drivers::timer::init();
     vlr_drivers::keyboard::init();
@@ -117,8 +131,126 @@ fn boot_test() -> ! {
     }
     let ticks = vlr_drivers::timer::ticks();
     vlr_console::println!("timer-ok ticks={ticks}");
+
+    let stats = vlr_memory::stats();
+    vlr_console::println!(
+        "frames total={} used={} free={}",
+        stats.frames_total,
+        stats.frames_used,
+        stats.frames_free
+    );
+    if stats.frames_total == 0 || stats.frames_free == 0 {
+        fail("frames-bad");
+    }
+    let offset = stats.phys_offset.expect("offset");
+    if vlr_memory::translate(offset) != Some(0) {
+        fail("offset-map-bad");
+    }
+    vlr_console::println!("offset-map-ok");
+
+    heap_checks();
+    paging_checks();
+
+    const FAULT_ADDR: u64 = 0xFFFF_8200_0000_0000;
+    vlr_arch::set_page_fault_hook(on_test_fault);
+    unsafe {
+        core::ptr::read_volatile(FAULT_ADDR as *const u8);
+    }
+    fail("page-fault-missing");
+}
+
+#[cfg(feature = "boot-test")]
+fn heap_checks() {
+    let mut big = alloc::vec![0u8; 1024 * 1024];
+    for (index, byte) in big.iter_mut().enumerate() {
+        *byte = (index & 0xFF) as u8;
+    }
+    let intact = big
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| *byte == (index & 0xFF) as u8);
+    if !intact || big.len() != 1024 * 1024 {
+        fail("heap-large-bad");
+    }
+    vlr_console::println!("heap-large-ok bytes={}", big.len());
+    drop(big);
+
+    let mut small = alloc::vec::Vec::new();
+    for index in 0..1000u32 {
+        small.push(alloc::boxed::Box::new(index));
+    }
+    let intact = small
+        .iter()
+        .enumerate()
+        .all(|(index, value)| **value == index as u32);
+    if !intact || small.len() != 1000 {
+        fail("heap-small-bad");
+    }
+    vlr_console::println!("heap-small-ok count={}", small.len());
+    drop(small);
+
+    let mut map = alloc::collections::BTreeMap::new();
+    map.insert(1u64, alloc::string::String::from("vlr"));
+    if map.get(&1).map(alloc::string::String::as_str) != Some("vlr") {
+        fail("heap-map-bad");
+    }
+    vlr_console::println!("heap-ok");
+}
+
+#[cfg(feature = "boot-test")]
+fn paging_checks() {
+    let frame = vlr_memory::alloc_frame().unwrap_or_else(|| fail("no-frame"));
+    let virt = 0xFFFF_8200_0000_0000u64;
+    if vlr_memory::map_4k(virt, frame, true).is_err() {
+        fail("map-bad");
+    }
+    unsafe {
+        (virt as *mut u64).write_volatile(0x1122_3344_5566_7788);
+    }
+    let saw = unsafe { core::ptr::read_volatile(virt as *const u64) };
+    let unmapped = vlr_memory::unmap_4k(virt).ok();
+    if vlr_memory::free_frame(frame).is_err() {
+        fail("free-frame-bad");
+    }
+    if saw != 0x1122_3344_5566_7788 || unmapped != Some(frame) {
+        fail("page-map-bad");
+    }
+    vlr_console::println!("page-map-ok");
+
+    let identity = vlr_memory::alloc_frame().unwrap_or_else(|| fail("no-identity-frame"));
+    if vlr_memory::translate(identity).is_some() {
+        let _ = vlr_memory::free_frame(identity);
+        fail("identity-slot-busy");
+    }
+    if vlr_memory::map_identity(identity).is_err() {
+        fail("identity-map-bad");
+    }
+    unsafe {
+        (identity as *mut u64).write_volatile(0x00C0_FFEE);
+    }
+    let via_offset = vlr_memory::phys_to_virt(identity).unwrap_or_else(|| fail("no-offset"));
+    let saw = unsafe { core::ptr::read_volatile(via_offset as *const u64) };
+    let unmapped = vlr_memory::unmap_4k(identity).ok();
+    if vlr_memory::free_frame(identity).is_err() {
+        fail("identity-free-bad");
+    }
+    if saw != 0x00C0_FFEE || unmapped != Some(identity) {
+        fail("page-identity-bad");
+    }
+    vlr_console::println!("page-identity-ok");
+}
+
+#[cfg(feature = "boot-test")]
+fn on_test_fault(addr: u64) -> ! {
+    vlr_console::println!("page-fault-ok addr={addr:#x}");
     vlr_console::println!("vlr-boot-ok");
     vlr_arch::debug_exit(true);
+}
+
+#[cfg(feature = "boot-test")]
+fn fail(message: &str) -> ! {
+    vlr_console::println!("boot-test-fail {message}");
+    vlr_arch::debug_exit(false);
 }
 
 fn log_exception(message: &str) {
@@ -149,6 +281,18 @@ impl vch::ShellIo for KernelShell {
 
     fn ticks(&mut self) -> u64 {
         vlr_drivers::timer::ticks()
+    }
+
+    fn memory(&mut self) -> vch::MemorySnapshot {
+        let stats = vlr_memory::stats();
+        vch::MemorySnapshot {
+            frames_total: stats.frames_total as u64,
+            frames_used: stats.frames_used as u64,
+            frames_free: stats.frames_free as u64,
+            heap_total: stats.heap_total as u64,
+            heap_used: stats.heap_used as u64,
+            heap_free: stats.heap_free as u64,
+        }
     }
 }
 

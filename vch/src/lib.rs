@@ -7,7 +7,23 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
+
+const HISTORY_LIMIT: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    pub frames_total: u64,
+    pub frames_used: u64,
+    pub frames_free: u64,
+    pub heap_total: u64,
+    pub heap_used: u64,
+    pub heap_free: u64,
+}
 
 pub trait ShellIo {
     fn write_str(&mut self, text: &str);
@@ -15,6 +31,7 @@ pub trait ShellIo {
     fn backspace(&mut self);
     fn read_byte(&mut self) -> u8;
     fn ticks(&mut self) -> u64;
+    fn memory(&mut self) -> MemorySnapshot;
 }
 
 pub struct ShellInfo {
@@ -27,15 +44,18 @@ pub struct ShellInfo {
 }
 
 pub fn run<I: ShellIo>(io: &mut I, info: &ShellInfo) -> ! {
+    let mut history = Vec::new();
     loop {
         write_prompt(io, info.username, info.home_display);
-        let mut raw = [0u8; 256];
-        let len = read_line(io, &mut raw);
-        let line = core::str::from_utf8(&raw[..len]).unwrap_or("");
+        let line = read_line(io);
         if line.is_empty() {
             continue;
         }
-        dispatch(io, info, line);
+        if history.len() == HISTORY_LIMIT {
+            history.remove(0);
+        }
+        history.push(line.clone());
+        dispatch(io, info, &line, &history);
     }
 }
 
@@ -70,24 +90,22 @@ pub fn format_prompt(username: &str, cwd: &str, out: &mut [u8]) -> usize {
     buf.used
 }
 
-pub fn read_line<I: ShellIo>(io: &mut I, buf: &mut [u8]) -> usize {
-    let mut len = 0;
+pub fn read_line<I: ShellIo>(io: &mut I) -> String {
+    let mut line = String::new();
     loop {
         match io.read_byte() {
             b'\n' | b'\r' => {
                 io.write_str("\n");
-                return len;
+                return line;
             }
             0x08 | 0x7F => {
-                if len > 0 {
-                    len -= 1;
+                if line.pop().is_some() {
                     io.backspace();
                 }
             }
             byte if (0x20..0x7F).contains(&byte) => {
-                if len < buf.len() {
-                    buf[len] = byte;
-                    len += 1;
+                if line.len() < 1024 {
+                    line.push(byte as char);
                     let text = [byte];
                     io.write_str(core::str::from_utf8(&text).unwrap_or(""));
                 }
@@ -97,7 +115,7 @@ pub fn read_line<I: ShellIo>(io: &mut I, buf: &mut [u8]) -> usize {
     }
 }
 
-pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str) {
+pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &[String]) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -117,7 +135,9 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str) {
                  pwd      current directory\n  \
                  whoami   current user\n  \
                  uname    system name\n  \
-                 ticks    hardware timer ticks\n",
+                 ticks    hardware timer ticks\n  \
+                 mem      frame and heap usage\n  \
+                 history  recent commands\n",
             );
         }
         "clear" => io.clear(),
@@ -152,6 +172,13 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str) {
             let n = format_ticks(info_ticks(io), &mut buf);
             let text = core::str::from_utf8(&buf[..n]).unwrap_or("ticks: ?\n");
             io.write_str(text);
+        }
+        "mem" => write_mem(io),
+        "history" => {
+            for (index, command) in history.iter().enumerate() {
+                let line = alloc::format!("{index} {command}\n");
+                io.write_str(&line);
+            }
         }
         _ => io.write_str("unknown command\n"),
     }
@@ -188,7 +215,7 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
     io.write_str(info.os_name);
     io.write_str(" (VLR) ");
     io.write_str(info.os_version);
-    io.write_str("\nx86-64 kernel, foundation milestone\nuser: ");
+    io.write_str("\nx86-64 kernel, memory milestone\nuser: ");
     io.write_str(info.username);
     io.write_str("\nhome: ");
     io.write_str(info.home_path);
@@ -224,6 +251,20 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
     io.write_str(text);
 }
 
+fn write_mem<I: ShellIo>(io: &mut I) {
+    let memory = io.memory();
+    let text = alloc::format!(
+        "frames: total {} used {} free {}\nheap: total {} used {} free {}\n",
+        memory.frames_total,
+        memory.frames_used,
+        memory.frames_free,
+        memory.heap_total,
+        memory.heap_used,
+        memory.heap_free
+    );
+    io.write_str(&text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +294,16 @@ mod tests {
         }
         fn ticks(&mut self) -> u64 {
             42
+        }
+        fn memory(&mut self) -> MemorySnapshot {
+            MemorySnapshot {
+                frames_total: 100,
+                frames_used: 40,
+                frames_free: 60,
+                heap_total: 4096,
+                heap_used: 128,
+                heap_free: 3968,
+            }
         }
     }
 
@@ -284,9 +335,8 @@ mod tests {
             out: std::string::String::new(),
             cleared: false,
         };
-        let mut buf = [0u8; 32];
-        let n = read_line(&mut io, &mut buf);
-        assert_eq!(&buf[..n], b"help");
+        let line = read_line(&mut io);
+        assert_eq!(line, "help");
         assert_eq!(io.out, "help\n");
     }
 
@@ -299,33 +349,47 @@ mod tests {
             cleared: false,
         };
         let info = info();
-        dispatch(&mut io, &info, "echo hello vlr");
+        let history = Vec::new();
+        dispatch(&mut io, &info, "echo hello vlr", &history);
         assert_eq!(io.out, "hello vlr\n");
 
         io.out.clear();
-        dispatch(&mut io, &info, "version");
+        dispatch(&mut io, &info, "version", &history);
         assert_eq!(io.out, "Veriluvrionikrousdorn 0.1.0\n");
 
         io.out.clear();
-        dispatch(&mut io, &info, "pwd");
+        dispatch(&mut io, &info, "pwd", &history);
         assert_eq!(io.out, "/Users/user (~)\n");
 
         io.out.clear();
-        dispatch(&mut io, &info, "ticks");
+        dispatch(&mut io, &info, "ticks", &history);
         assert_eq!(io.out, "ticks: 42\n");
 
         io.out.clear();
-        dispatch(&mut io, &info, "nope");
+        dispatch(&mut io, &info, "mem", &history);
+        assert_eq!(
+            io.out,
+            "frames: total 100 used 40 free 60\nheap: total 4096 used 128 free 3968\n"
+        );
+
+        io.out.clear();
+        let history = alloc::vec![String::from("echo hello"), String::from("history")];
+        dispatch(&mut io, &info, "history", &history);
+        assert_eq!(io.out, "0 echo hello\n1 history\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "nope", &[]);
         assert_eq!(io.out, "unknown command\n");
 
-        dispatch(&mut io, &info, "help");
+        dispatch(&mut io, &info, "help", &[]);
         assert!(io.out.contains("echo"));
+        assert!(io.out.contains("mem"));
 
-        dispatch(&mut io, &info, "clear");
+        dispatch(&mut io, &info, "clear", &[]);
         assert!(io.cleared);
 
         io.out.clear();
-        dispatch(&mut io, &info, "about");
+        dispatch(&mut io, &info, "about", &[]);
         assert!(io.out.contains("Veriluvrionikrousdorn"));
         assert!(io.out.contains("/Apps/vch/vch.vlr"));
         assert!(io.out.contains("128 MiB"));

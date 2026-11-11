@@ -1,10 +1,15 @@
-use spin::Once;
+use spin::{Mutex, Once};
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+static PAGE_FAULT_HOOK: Mutex<Option<fn(u64) -> !>> = Mutex::new(None);
+
+pub fn set_page_fault_hook(hook: fn(u64) -> !) {
+    *PAGE_FAULT_HOOK.lock() = Some(hook);
+}
 
 pub fn init() {
     idt().load();
@@ -50,10 +55,14 @@ extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error: PageFaultErrorCode,
 ) {
-    let address = Cr2::read();
+    let address = Cr2::read_raw();
     crate::log_exception(format_args!(
-        "exception: page fault at {address:?} error={error:?}\n{frame:?}\n"
+        "exception: page fault at {address:#x} error={error:?}\n{frame:?}\n"
     ));
+    let hook = *PAGE_FAULT_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(address);
+    }
     crate::hlt_loop();
 }
 

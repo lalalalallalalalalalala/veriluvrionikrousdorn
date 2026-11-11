@@ -171,7 +171,7 @@ fn host_tests() -> Result<()> {
         "CARGO_TARGET_DIR",
         workspace_root().join("target/host-test"),
     );
-    command.args(["test", "-p", "vch", "-p", "vlr-loader"]);
+    command.args(["test", "-p", "vch", "-p", "vlr-loader", "-p", "vlr-memory"]);
     let status = command.status().context("failed to spawn cargo test")?;
     if !status.success() {
         bail!("host tests failed");
@@ -222,8 +222,16 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.1.0",
+        "VLR kernel 0.2.0",
         "timer-ok",
+        "offset-map-ok",
+        "heap-large-ok",
+        "heap-small-ok",
+        "heap-ok",
+        "page-map-ok",
+        "page-identity-ok",
+        "exception: page fault at 0xffff820000000000",
+        "page-fault-ok addr=0xffff820000000000",
         "vlr-boot-ok",
     ] {
         if !log.contains(needle) {
@@ -305,6 +313,20 @@ fn shell_session() -> Result<()> {
     writer.flush().ok();
     if !wait_for(&captured, "hello", Duration::from_secs(5)) {
         bail!("echo output missing:\n{}", captured.lock().unwrap());
+    }
+
+    writer.write_all(b"history\r").context("write history")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "1 echo hello", Duration::from_secs(5)) {
+        bail!("history missing echo:\n{}", captured.lock().unwrap());
+    }
+
+    writer.write_all(b"mem\r").context("write mem")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "frames: total", Duration::from_secs(5))
+        || !wait_for(&captured, "heap: total", Duration::from_secs(5))
+    {
+        bail!("mem output missing:\n{}", captured.lock().unwrap());
     }
 
     writer.write_all(b"bogus\r").context("write bogus")?;
