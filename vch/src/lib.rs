@@ -45,6 +45,11 @@ pub trait ShellIo {
     fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str>;
     fn kill_task(&mut self, id: u64) -> Result<(), &'static str>;
     fn run_user(&mut self, name: &str) -> Result<u64, &'static str>;
+    fn current_dir(&mut self) -> String;
+    fn change_dir(&mut self, path: &str);
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>, &'static str>;
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, &'static str>;
+    fn exec(&mut self, path: &str) -> Result<u64, &'static str>;
 }
 
 pub struct ShellInfo {
@@ -59,7 +64,13 @@ pub struct ShellInfo {
 pub fn run<I: ShellIo>(io: &mut I, info: &ShellInfo) -> ! {
     let mut history = Vec::new();
     loop {
-        write_prompt(io, info.username, info.home_display);
+        let cwd = io.current_dir();
+        let shown = if cwd == info.home_path {
+            String::from(info.home_display)
+        } else {
+            cwd
+        };
+        write_prompt(io, info.username, &shown);
         let line = read_line(io);
         if line.is_empty() {
             continue;
@@ -154,7 +165,10 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  ps       list tasks\n  \
                  spawn    spawn ticker or spinner\n  \
                  kill     stop a task by id\n  \
-                 run      run hello, greet, or bad in ring 3\n",
+                 ls       list a directory\n  \
+                 cat      print a file\n  \
+                 cd       change directory\n  \
+                 run      run a .vlr by name or path\n",
             );
         }
         "clear" => io.clear(),
@@ -170,10 +184,16 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
         }
         "about" => write_about(io, info),
         "pwd" => {
-            io.write_str(info.home_path);
-            io.write_str(" (");
-            io.write_str(info.home_display);
-            io.write_str(")\n");
+            let cwd = io.current_dir();
+            if cwd == info.home_path {
+                io.write_str(info.home_path);
+                io.write_str(" (");
+                io.write_str(info.home_display);
+                io.write_str(")\n");
+            } else {
+                io.write_str(&cwd);
+                io.write_str("\n");
+            }
         }
         "whoami" => {
             io.write_str(info.username);
@@ -215,23 +235,132 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
             },
             None => io.write_str("kill failed\n"),
         },
-        "run" => match io.run_user(rest) {
-            Ok(id) => {
-                let line = alloc::format!("user {id}\n");
-                io.write_str(&line);
+        "run" => {
+            let path = program_path(io, info, rest);
+            launch(io, &path);
+        }
+        "ls" => {
+            let path = if rest.is_empty() {
+                io.current_dir()
+            } else {
+                io_path(io, info, rest)
+            };
+            match io.list_dir(&path) {
+                Ok(names) => {
+                    if names.is_empty() {
+                        io.write_str("\n");
+                    }
+                    for name in names {
+                        io.write_str(&name);
+                        io.write_str("\n");
+                    }
+                }
+                Err(err) => {
+                    io.write_str(err);
+                    io.write_str("\n");
+                }
             }
-            Err(err) => {
-                io.write_str(err);
-                io.write_str("\n");
+        }
+        "cat" => {
+            let path = io_path(io, info, rest);
+            match io.read_file(&path) {
+                Ok(bytes) => {
+                    let text = core::str::from_utf8(&bytes).unwrap_or("?");
+                    io.write_str(text);
+                    if !text.ends_with('\n') {
+                        io.write_str("\n");
+                    }
+                }
+                Err(err) => {
+                    io.write_str(err);
+                    io.write_str("\n");
+                }
             }
-        },
+        }
+        "cd" => {
+            let path = if rest.is_empty() {
+                String::from(info.home_path)
+            } else {
+                io_path(io, info, rest)
+            };
+            match io.list_dir(&path) {
+                Ok(_) => io.change_dir(&path),
+                Err(err) => {
+                    io.write_str(err);
+                    io.write_str("\n");
+                }
+            }
+        }
         "history" => {
             for (index, command) in history.iter().enumerate() {
                 let line = alloc::format!("{index} {command}\n");
                 io.write_str(&line);
             }
         }
-        _ => io.write_str("unknown command\n"),
+        _ => {
+            if command.starts_with('/') {
+                launch(io, command);
+            } else {
+                let path = alloc::format!("/Apps/{command}/{command}.vlr");
+                match io.exec(&path) {
+                    Ok(id) => {
+                        let line = alloc::format!("user {id}\n");
+                        io.write_str(&line);
+                    }
+                    Err("rejected") => io.write_str("rejected\n"),
+                    Err(_) => io.write_str("unknown command\n"),
+                }
+            }
+        }
+    }
+}
+
+fn launch<I: ShellIo>(io: &mut I, path: &str) {
+    if path.is_empty() {
+        io.write_str("unknown program\n");
+        return;
+    }
+    match io.exec(path) {
+        Ok(id) => {
+            let line = alloc::format!("user {id}\n");
+            io.write_str(&line);
+        }
+        Err(err) => {
+            io.write_str(err);
+            io.write_str("\n");
+        }
+    }
+}
+
+fn program_path<I: ShellIo>(io: &mut I, info: &ShellInfo, input: &str) -> String {
+    if input.starts_with('/') || input.contains('/') {
+        let path = io_path(io, info, input);
+        if path.ends_with(".vlr") {
+            path
+        } else {
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            alloc::format!("{path}/{name}.vlr")
+        }
+    } else {
+        alloc::format!("/Apps/{input}/{input}.vlr")
+    }
+}
+
+fn io_path<I: ShellIo>(io: &mut I, info: &ShellInfo, input: &str) -> String {
+    if input.is_empty() || input == "~" {
+        return String::from(info.home_path);
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        return alloc::format!("{}/{rest}", info.home_path);
+    }
+    if input.starts_with('/') {
+        return String::from(input);
+    }
+    let cwd = io.current_dir();
+    if cwd == "/" {
+        alloc::format!("/{input}")
+    } else {
+        alloc::format!("{cwd}/{input}")
     }
 }
 
@@ -356,6 +485,7 @@ mod tests {
         pos: usize,
         out: std::string::String,
         cleared: bool,
+        cwd: String,
     }
 
     impl ShellIo for MemIo {
@@ -426,6 +556,50 @@ mod tests {
                 Err("unknown program")
             }
         }
+        fn current_dir(&mut self) -> String {
+            self.cwd.clone()
+        }
+        fn change_dir(&mut self, path: &str) {
+            self.cwd = String::from(path);
+        }
+        fn list_dir(&mut self, path: &str) -> Result<Vec<String>, &'static str> {
+            match path {
+                "/Apps" => Ok(alloc::vec![
+                    String::from("badfmt"),
+                    String::from("greet"),
+                    String::from("hello"),
+                    String::from("vch"),
+                ]),
+                "/Users/user" => Ok(alloc::vec![String::from("motd")]),
+                _ => Err("not found"),
+            }
+        }
+        fn read_file(&mut self, path: &str) -> Result<Vec<u8>, &'static str> {
+            if path == "/Users/user/motd" {
+                Ok(alloc::vec![b'v', b'l', b'r', b'-', b'm', b'o', b't', b'd', b'\n'])
+            } else {
+                Err("not found")
+            }
+        }
+        fn exec(&mut self, path: &str) -> Result<u64, &'static str> {
+            if path.contains("badfmt") {
+                Err("rejected")
+            } else if path.contains("hello") {
+                Ok(7)
+            } else {
+                Err("unknown program")
+            }
+        }
+    }
+
+    fn io(input: &'static [u8]) -> MemIo {
+        MemIo {
+            input,
+            pos: 0,
+            out: std::string::String::new(),
+            cleared: false,
+            cwd: String::from("/Users/user"),
+        }
     }
 
     fn info() -> ShellInfo {
@@ -450,12 +624,7 @@ mod tests {
 
     #[test]
     fn line_echoes_and_supports_backspace() {
-        let mut io = MemIo {
-            input: b"heX\x08lp\n",
-            pos: 0,
-            out: std::string::String::new(),
-            cleared: false,
-        };
+        let mut io = io(b"heX\x08lp\n");
         let line = read_line(&mut io);
         assert_eq!(line, "help");
         assert_eq!(io.out, "help\n");
@@ -463,12 +632,7 @@ mod tests {
 
     #[test]
     fn builtins_and_unknown_command() {
-        let mut io = MemIo {
-            input: b"",
-            pos: 0,
-            out: std::string::String::new(),
-            cleared: false,
-        };
+        let mut io = io(b"");
         let info = info();
         let history = Vec::new();
         dispatch(&mut io, &info, "echo hello vlr", &history);
@@ -533,6 +697,24 @@ mod tests {
         io.out.clear();
         dispatch(&mut io, &info, "nope", &[]);
         assert_eq!(io.out, "unknown command\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "ls /Apps", &[]);
+        assert!(io.out.contains("vch"));
+        assert!(io.out.contains("hello"));
+
+        io.out.clear();
+        dispatch(&mut io, &info, "cat /Users/user/motd", &[]);
+        assert_eq!(io.out, "vlr-motd\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "cd /Apps", &[]);
+        dispatch(&mut io, &info, "pwd", &[]);
+        assert_eq!(io.out, "/Apps\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "run /Apps/badfmt/badfmt.vlr", &[]);
+        assert_eq!(io.out, "rejected\n");
 
         dispatch(&mut io, &info, "help", &[]);
         assert!(io.out.contains("echo"));

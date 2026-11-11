@@ -1,14 +1,20 @@
-//! Черновик формата `.vlr` и правила, по которым будущий загрузчик найдёт
-//! приложение. Исполнение образа не реализовано: [`load`] узнаёт магию и
-//! останавливается.
+//! Формат `.vlr` версии 1 и загрузчик в кольцо 3.
 //!
-//! Версия формата `0` значит «черновик, раскладка ещё может измениться».
+//! Образ: заголовок 32 байта, затем таблица секций по 56 байт, затем байты
+//! секций. Точка входа — `image_base + entry_rva`. Список библиотек может быть
+//! пустым: `vch` собран статически с `vlr-libc`.
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
 pub const MAGIC: [u8; 4] = [0x7F, b'V', b'L', b'R'];
-pub const FORMAT_VERSION: u16 = 0;
+pub const FORMAT_VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 32;
+pub const SECTION_LEN: usize = 56;
 
 pub const KIND_EXECUTABLE: u16 = 1;
 pub const KIND_LIBRARY: u16 = 2;
@@ -41,10 +47,22 @@ pub enum FormatError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadError {
     BadImage,
-    NotImplemented,
+    NotFound,
+    Unsupported,
+    Memory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Section {
+    pub name: [u8; 16],
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub virt_addr: u64,
+    pub virt_size: u64,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VlrHeader {
     pub magic: [u8; 4],
     pub format_version: u16,
@@ -96,10 +114,145 @@ pub fn parse_header(image: &[u8]) -> Result<VlrHeader, FormatError> {
     })
 }
 
-/// Узнать свой образ и отказаться его отображать: загрузчика пользователей ещё нет.
+pub fn parse(image: &[u8]) -> Result<(VlrHeader, Vec<Section>), FormatError> {
+    let header = parse_header(image)?;
+    if header.format_version > FORMAT_VERSION || header.header_size < HEADER_LEN as u16 {
+        return Err(FormatError::BadMagic);
+    }
+    let mut sections = Vec::new();
+    let mut at = header.header_size as usize;
+    for _ in 0..header.section_count {
+        if at + SECTION_LEN > image.len() {
+            return Err(FormatError::TooSmall);
+        }
+        let raw = &image[at..at + SECTION_LEN];
+        let mut name = [0u8; 16];
+        name.copy_from_slice(&raw[0..16]);
+        sections.push(Section {
+            name,
+            file_offset: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+            file_size: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+            virt_addr: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
+            virt_size: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
+            flags: u32::from_le_bytes(raw[48..52].try_into().unwrap()),
+        });
+        at += SECTION_LEN;
+    }
+    Ok((header, sections))
+}
+
 pub fn load(image: &[u8]) -> Result<(), LoadError> {
-    parse_header(image).map_err(|_| LoadError::BadImage)?;
-    Err(LoadError::NotImplemented)
+    parse(image).map_err(|_| LoadError::BadImage)?;
+    Ok(())
+}
+
+pub fn exec_path(path: &str) -> Result<u64, LoadError> {
+    let bytes = vlr_vfs::read_file(path).map_err(|_| LoadError::NotFound)?;
+    exec_bytes(file_stem(path), &bytes)
+}
+
+pub fn exec_bytes(name: &str, image: &[u8]) -> Result<u64, LoadError> {
+    let (header, sections) = parse(image).map_err(|_| LoadError::BadImage)?;
+    if header.kind != KIND_EXECUTABLE || header.import_count != 0 {
+        return Err(LoadError::Unsupported);
+    }
+    let cr3 = vlr_memory::create_user_space().map_err(|_| LoadError::Memory)?;
+    map_sections(cr3, image, &sections)?;
+    let stack_base = 0x700000u64;
+    let stack_pages = 16u64;
+    for page in 0..stack_pages {
+        let frame = vlr_memory::alloc_frame().ok_or(LoadError::Memory)?;
+        if let Some(virt) = vlr_memory::phys_to_virt(frame) {
+            unsafe { core::ptr::write_bytes(virt as *mut u8, 0, 4096) };
+        }
+        vlr_memory::map_user_page(cr3, stack_base + page * 4096, frame, true, false)
+            .map_err(|_| LoadError::Memory)?;
+    }
+    let entry = header.image_base.wrapping_add(header.entry_rva);
+    let stack_top = stack_base + stack_pages * 4096;
+    vlr_sched::spawn_user(name, enter_user_task, cr3, entry, stack_top)
+        .map(|id| id.0)
+        .map_err(|_| LoadError::Memory)
+}
+
+struct MappedPage {
+    frame: u64,
+    writable: bool,
+    executable: bool,
+}
+
+fn map_sections(cr3: u64, image: &[u8], sections: &[Section]) -> Result<(), LoadError> {
+    let mut pages: BTreeMap<u64, MappedPage> = BTreeMap::new();
+    for section in sections {
+        if section.virt_size == 0 {
+            continue;
+        }
+        let start = section.virt_addr & !0xfff;
+        let end = section.virt_addr.saturating_add(section.virt_size);
+        let end_page = (end.saturating_add(4095)) & !0xfff;
+        let mut page = start;
+        while page < end_page {
+            if !pages.contains_key(&page) {
+                let frame = vlr_memory::alloc_frame().ok_or(LoadError::Memory)?;
+                let Some(dest) = vlr_memory::phys_to_virt(frame) else {
+                    return Err(LoadError::Memory);
+                };
+                unsafe { core::ptr::write_bytes(dest as *mut u8, 0, 4096) };
+                pages.insert(
+                    page,
+                    MappedPage {
+                        frame,
+                        writable: false,
+                        executable: false,
+                    },
+                );
+            }
+            let entry = pages.get_mut(&page).unwrap();
+            if section.flags & SECTION_WRITE != 0 {
+                entry.writable = true;
+            }
+            if section.flags & SECTION_EXEC != 0 {
+                entry.executable = true;
+            }
+            page = page.saturating_add(4096);
+        }
+        for index in 0..section.file_size {
+            let virt = section.virt_addr.wrapping_add(index);
+            let page = virt & !0xfff;
+            let Some(entry) = pages.get(&page) else {
+                return Err(LoadError::Memory);
+            };
+            let file_at = section.file_offset.wrapping_add(index) as usize;
+            if file_at >= image.len() {
+                return Err(LoadError::BadImage);
+            }
+            let Some(dest) = vlr_memory::phys_to_virt(entry.frame) else {
+                return Err(LoadError::Memory);
+            };
+            unsafe {
+                *((dest + (virt & 0xfff)) as *mut u8) = image[file_at];
+            }
+        }
+    }
+    for (virt, page) in pages {
+        vlr_memory::map_user_page(cr3, virt, page.frame, page.writable, page.executable)
+            .map_err(|_| LoadError::Memory)?;
+    }
+    Ok(())
+}
+
+fn enter_user_task() {
+    let (ip, sp, kstack) = vlr_sched::user_start();
+    vlr_arch::disable_interrupts();
+    let cr3 = vlr_sched::current_cr3();
+    vlr_memory::activate_cr3(cr3);
+    vlr_arch::set_kernel_stack(kstack);
+    unsafe { vlr_arch::enter_user(ip, sp, kstack) };
+}
+
+fn file_stem(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(".vlr").unwrap_or(name)
 }
 
 pub fn init() {}
@@ -137,8 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn load_recognizes_magic_but_does_not_run() {
-        assert_eq!(load(&sample()), Err(LoadError::NotImplemented));
+    fn load_accepts_a_header_and_rejects_garbage() {
+        assert!(load(&sample()).is_ok());
         assert_eq!(load(b"nope"), Err(LoadError::BadImage));
     }
 

@@ -1,0 +1,15 @@
+[package]
+name = "vch-bin"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "vch-bin"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vch = { path = "../../vch" }
+vlr-libc = { path = "../vlr-libc", features = ["runtime"] }

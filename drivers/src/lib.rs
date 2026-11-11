@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod ata;
 pub mod block;
 pub mod display;
 pub mod input;

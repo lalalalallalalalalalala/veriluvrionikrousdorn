@@ -156,12 +156,8 @@ fn user_index() -> usize {
 }
 
 fn choose_user_index() -> usize {
-    let l4 = kernel_l4();
-    for index in 0..256 {
-        if !l4[index].flags().contains(PageTableFlags::PRESENT) {
-            return index;
-        }
-    }
+    // Программы `.vlr` собраны по адресу `0x400000` (индекс L4 0).
+    // Слот в таблице пользователя свой: код ядра лежит в другом индексе.
     0
 }
 

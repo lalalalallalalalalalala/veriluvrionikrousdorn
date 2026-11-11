@@ -11,8 +11,10 @@ bench = false
 
 [dependencies]
 vlr-arch = { path = "../arch" }
+vlr-btrfs = { path = "../btrfs" }
 vlr-console = { path = "../console" }
 vlr-drivers = { path = "../drivers" }
 vlr-libc = { path = "../user/vlr-libc" }
+vlr-loader = { path = "../loader" }
 vlr-memory = { path = "../memory" }
 vlr-sched = { path = "../sched" }

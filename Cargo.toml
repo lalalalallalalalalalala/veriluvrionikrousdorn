@@ -13,6 +13,9 @@ members = [
     "loader",
     "vch",
     "user/vlr-libc",
+    "user/hello",
+    "user/greet",
+    "user/vch-bin",
     "xtask",
 ]
 default-members = ["xtask"]

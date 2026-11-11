@@ -1,10 +1,13 @@
-//! Виртуальная файловая система.
+//! Виртуальная файловая система поверх Btrfs только для чтения.
 //!
-//! Слой не знает про Btrfs напрямую: файловая система реализует [`Filesystem`]
-//! и сидит на [`BlockDevice`]. Таблица монтирования появится вместе с кучей.
-//! Пока любая операция сообщает, что реализация ещё не написана.
+//! Остальное ядро открывает пути здесь и не знает про чанки и деревья.
 
 #![no_std]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 pub use vlr_drivers::block::{BlockDevice, BlockError};
 
@@ -15,56 +18,41 @@ pub enum FsType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
-    NotImplemented,
+    NotMounted,
     NotFound,
+    NotDirectory,
     InvalidPath,
     Io,
+    Compressed,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(pub u64);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DirEntry {
-    pub name: [u8; 255],
-    pub name_len: u8,
-    pub node: NodeId,
+    pub name: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MountOptions {
-    /// Первая рабочая версия Btrfs будет только для чтения.
-    pub read_only: bool,
+pub fn mount() -> Result<(), VfsError> {
+    vlr_btrfs::mount_global().map_err(map_err)
 }
 
-pub trait Filesystem {
-    fn fs_type(&self) -> FsType;
-    fn lookup(&mut self, path: &str) -> Result<NodeId, VfsError>;
-    fn read(&mut self, node: NodeId, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
-    fn readdir(&mut self, node: NodeId, index: usize) -> Result<Option<DirEntry>, VfsError>;
+pub fn read_file(path: &str) -> Result<Vec<u8>, VfsError> {
+    vlr_btrfs::read_path(path).map_err(map_err)
 }
 
-pub struct Vfs;
+pub fn list_dir(path: &str) -> Result<Vec<String>, VfsError> {
+    vlr_btrfs::list_path(path).map_err(map_err)
+}
 
-impl Vfs {
-    pub const fn new() -> Self {
-        Self
+fn map_err(err: vlr_btrfs::BtrfsError) -> VfsError {
+    match err {
+        vlr_btrfs::BtrfsError::NotFound => VfsError::NotFound,
+        vlr_btrfs::BtrfsError::NotDirectory => VfsError::NotDirectory,
+        vlr_btrfs::BtrfsError::Compressed => VfsError::Compressed,
+        vlr_btrfs::BtrfsError::Unsupported => VfsError::Unsupported,
+        vlr_btrfs::BtrfsError::BadMagic | vlr_btrfs::BtrfsError::Io => VfsError::Io,
     }
-
-    pub fn mount(
-        &mut self,
-        _path: &str,
-        _fs: FsType,
-        _options: MountOptions,
-    ) -> Result<(), VfsError> {
-        Err(VfsError::NotImplemented)
-    }
-
-    pub fn open(&mut self, _path: &str) -> Result<NodeId, VfsError> {
-        Err(VfsError::NotImplemented)
-    }
-}
-
-pub fn init() -> Vfs {
-    Vfs::new()
 }

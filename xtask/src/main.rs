@@ -37,11 +37,16 @@ fn run() -> Result<()> {
 
     match command {
         "build" => {
+            build_userspace()?;
+            make_filesystem()?;
             build_kernel(false)?;
             make_image()?;
             println!("image: {}", image_path().display());
+            println!("disk: {}", disk_path().display());
         }
         "run" => {
+            build_userspace()?;
+            make_filesystem()?;
             build_kernel(false)?;
             make_image()?;
             run_qemu(gui)?;
@@ -79,6 +84,10 @@ fn kernel_elf(boot_test: bool) -> PathBuf {
 
 fn image_path() -> PathBuf {
     workspace_root().join("target/vlr-bios.img")
+}
+
+fn disk_path() -> PathBuf {
+    workspace_root().join("target/vlr-btrfs.img")
 }
 
 fn cargo() -> Command {
@@ -155,7 +164,15 @@ fn qemu(gui: bool, test_exit: bool) -> Command {
         .arg("-m")
         .arg("256M")
         .arg("-drive")
-        .arg(format!("format=raw,if=ide,file={}", image_path().display()))
+        .arg(format!(
+            "format=raw,if=ide,index=0,file={}",
+            image_path().display()
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "format=raw,if=ide,index=1,file={}",
+            disk_path().display()
+        ))
         .arg("-no-reboot");
     if test_exit {
         command
@@ -181,6 +198,8 @@ fn host_tests() -> Result<()> {
         "vlr-memory",
         "-p",
         "vlr-libc",
+        "-p",
+        "vlr-btrfs",
     ]);
     let status = command.status().context("failed to spawn cargo test")?;
     if !status.success() {
@@ -190,6 +209,8 @@ fn host_tests() -> Result<()> {
 }
 
 fn boot_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
     build_kernel(true)?;
     make_image()?;
     let log_path = workspace_root().join("target/boot-test.log");
@@ -202,7 +223,7 @@ fn boot_test() -> Result<()> {
     let mut command = Command::new("timeout");
     command
         .arg("--foreground")
-        .arg("60")
+        .arg("90")
         .arg("qemu-system-x86_64")
         .arg("-machine")
         .arg("pc")
@@ -215,7 +236,15 @@ fn boot_test() -> Result<()> {
         .arg("-m")
         .arg("256M")
         .arg("-drive")
-        .arg(format!("format=raw,if=ide,file={}", image_path().display()))
+        .arg(format!(
+            "format=raw,if=ide,index=0,file={}",
+            image_path().display()
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "format=raw,if=ide,index=1,file={}",
+            disk_path().display()
+        ))
         .arg("-display")
         .arg("none")
         .arg("-serial")
@@ -232,7 +261,17 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.4.0",
+        "VLR kernel 0.5.0",
+        "btrfs-ok",
+        "motd-ok",
+        "apps-ok",
+        "vch-loaded",
+        "user@::vch#~ ",
+        "ls /Apps",
+        "badfmt",
+        "vlr-motd",
+        "rejected",
+        "disk-shell-ok",
         "timer-ok",
         "offset-map-ok",
         "heap-large-ok",
@@ -261,6 +300,8 @@ fn boot_test() -> Result<()> {
 }
 
 fn shell_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
     build_kernel(false)?;
     make_image()?;
     let stderr_path = workspace_root().join("target/shell-test-qemu.log");
@@ -388,6 +429,173 @@ fn shell_session() -> Result<()> {
     if !wait_for(&captured, "/Users/user (~)", Duration::from_secs(5)) {
         bail!("pwd output missing:\n{}", captured.lock().unwrap());
     }
+
+    writer.write_all(b"ls /Apps\r").context("write ls")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "badfmt", Duration::from_secs(5))
+        || !wait_for(&captured, "vch", Duration::from_secs(5))
+    {
+        bail!("ls output missing:\n{}", captured.lock().unwrap());
+    }
+    writer
+        .write_all(b"cat /Users/user/motd\r")
+        .context("write cat")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "vlr-motd", Duration::from_secs(5)) {
+        bail!("cat output missing:\n{}", captured.lock().unwrap());
+    }
+    Ok(())
+}
+
+fn build_userspace() -> Result<()> {
+    let target = workspace_root().join("target/user-build");
+    for package in ["hello", "greet", "vch-bin"] {
+        let mut command = cargo();
+        command.env("CARGO_TARGET_DIR", &target);
+        command.args([
+            "build",
+            "-p",
+            package,
+            "--target",
+            "x86_64-unknown-none",
+        ]);
+        let status = command.status().context("failed to spawn userspace build")?;
+        if !status.success() {
+            bail!("{package} build failed");
+        }
+    }
+    Ok(())
+}
+
+fn make_filesystem() -> Result<()> {
+    let root = workspace_root().join("target/disk-root");
+    if root.exists() {
+        fs::remove_dir_all(&root)?;
+    }
+    for dir in [
+        "Apps/vch",
+        "Apps/hello",
+        "Apps/greet",
+        "Apps/badfmt",
+        "AppData/vch/config",
+        "AppData/vch/data",
+        "AppData/vch/cache",
+        "Libs",
+        "Users/user",
+    ] {
+        fs::create_dir_all(root.join(dir))?;
+    }
+    let bins = workspace_root().join("target/user-build/x86_64-unknown-none/debug");
+    pack(&bins.join("hello"), &root.join("Apps/hello/hello.vlr"))?;
+    pack(&bins.join("greet"), &root.join("Apps/greet/greet.vlr"))?;
+    pack(&bins.join("vch-bin"), &root.join("Apps/vch/vch.vlr"))?;
+    fs::write(root.join("Apps/badfmt/badfmt.vlr"), b"not-a-vlr")?;
+    fs::write(root.join("Users/user/motd"), b"vlr-motd\n")?;
+    fs::write(root.join("Libs/.keep"), b"")?;
+    fs::write(root.join("AppData/vch/config/.keep"), b"")?;
+    fs::write(root.join("AppData/vch/data/.keep"), b"")?;
+    fs::write(root.join("AppData/vch/cache/.keep"), b"")?;
+    let image = disk_path();
+    if image.exists() {
+        fs::remove_file(&image)?;
+    }
+    fs::write(&image, vec![0u8; 64 * 1024 * 1024])?;
+    let status = Command::new("mkfs.btrfs")
+        .args([
+            "-q",
+            "-f",
+            "-m",
+            "single",
+            "-d",
+            "single",
+            "-r",
+            root.to_str().context("root path")?,
+            "--shrink",
+            image.to_str().context("image path")?,
+        ])
+        .status()
+        .context("mkfs.btrfs")?;
+    if !status.success() {
+        bail!("mkfs.btrfs failed");
+    }
+    Ok(())
+}
+
+fn pack(elf_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let elf = fs::read(elf_path).with_context(|| format!("read {}", elf_path.display()))?;
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
+        bail!("{} is not an ELF", elf_path.display());
+    }
+    let entry = u64::from_le_bytes(elf[24..32].try_into().unwrap());
+    let phoff = u64::from_le_bytes(elf[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(elf[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap()) as usize;
+    let mut loads = Vec::new();
+    for index in 0..phnum {
+        let at = phoff + index * phentsize;
+        let kind = u32::from_le_bytes(elf[at..at + 4].try_into().unwrap());
+        if kind != 1 {
+            continue;
+        }
+        let flags = u32::from_le_bytes(elf[at + 4..at + 8].try_into().unwrap());
+        let offset = u64::from_le_bytes(elf[at + 8..at + 16].try_into().unwrap());
+        let vaddr = u64::from_le_bytes(elf[at + 16..at + 24].try_into().unwrap());
+        let filesz = u64::from_le_bytes(elf[at + 32..at + 40].try_into().unwrap());
+        let memsz = u64::from_le_bytes(elf[at + 40..at + 48].try_into().unwrap());
+        loads.push((flags, offset, vaddr, filesz, memsz));
+    }
+    if loads.is_empty() {
+        bail!("{} has no loadable segment", elf_path.display());
+    }
+    let image_base = loads.iter().map(|load| load.2).min().unwrap();
+    let entry_rva = entry.wrapping_sub(image_base);
+    let mut section_table = Vec::new();
+    let mut payload = Vec::new();
+    let data_start = 32 + loads.len() * 56;
+    for (index, (flags, offset, vaddr, filesz, memsz)) in loads.iter().copied().enumerate() {
+        let mut section = [0u8; 56];
+        let name = if flags & 1 != 0 { b"text" } else { b"data" };
+        section[..name.len()].copy_from_slice(name);
+        if index > 0 && name == b"text" {
+            section[..4].copy_from_slice(b"segm");
+        }
+        let file_off = (data_start + payload.len()) as u64;
+        section[16..24].copy_from_slice(&file_off.to_le_bytes());
+        section[24..32].copy_from_slice(&filesz.to_le_bytes());
+        section[32..40].copy_from_slice(&vaddr.to_le_bytes());
+        section[40..48].copy_from_slice(&memsz.to_le_bytes());
+        let mut vlr_flags = 1u32;
+        if flags & 2 != 0 {
+            vlr_flags |= 2;
+        }
+        if flags & 1 != 0 {
+            vlr_flags |= 4;
+        }
+        section[48..52].copy_from_slice(&vlr_flags.to_le_bytes());
+        section_table.extend_from_slice(&section);
+        let start = offset as usize;
+        let end = start + filesz as usize;
+        if end > elf.len() {
+            bail!("segment runs past the ELF");
+        }
+        payload.extend_from_slice(&elf[start..end]);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x7fVLR");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&(loads.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&entry_rva.to_le_bytes());
+    out.extend_from_slice(&image_base.to_le_bytes());
+    out.extend_from_slice(&section_table);
+    out.extend_from_slice(&payload);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, out)?;
     Ok(())
 }
 

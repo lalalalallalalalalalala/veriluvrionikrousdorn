@@ -18,8 +18,8 @@ use spin::Mutex;
 pub use frame::{align_down, align_up, BitmapFrameAlloc, FreeError, PAGE_SIZE};
 pub use heap::KernelAllocator;
 pub use user::{
-    activate_cr3, create_user_space, free_user_space, is_user_range, map_user_page, user_code,
-    user_stack_page, user_stack_top,
+    activate_cr3, create_user_space, free_user_space, is_user_range, map_user_page, user_base,
+    user_code, user_stack_page, user_stack_top,
 };
 
 const MAX_PHYS: u64 = 1 << 32;

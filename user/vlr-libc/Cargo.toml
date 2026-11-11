@@ -5,4 +5,8 @@ edition = "2021"
 publish = false
 description = "Userspace syscall wrappers for future .vlr programs"
 
+[features]
+default = []
+runtime = []
+
 [dependencies]

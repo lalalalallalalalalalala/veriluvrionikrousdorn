@@ -1,14 +1,10 @@
 [package]
 name = "vlr-btrfs"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
-description = "Btrfs filesystem (planned; not implemented this milestone)"
-
-[lib]
-test = false
-bench = false
+description = "Read-only Btrfs"
 
 [dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 vlr-drivers = { path = "../drivers" }
-vlr-vfs = { path = "../vfs" }

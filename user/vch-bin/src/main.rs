@@ -1,0 +1,203 @@
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use vch::{MemorySnapshot, ShellInfo, ShellIo, TaskSnapshot};
+use vlr_libc::{
+    close, exec, getticks, kill, kspawn, memstat, open, read, readdir, taskstat, write, MemInfo,
+    TaskRec, FD_STDOUT,
+};
+
+struct SysIo {
+    cwd: String,
+}
+
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    let info = ShellInfo {
+        username: "user",
+        os_name: "Veriluvrionikrousdorn",
+        os_version: "0.5.0",
+        usable_memory: 0,
+        home_display: "~",
+        home_path: "/Users/user",
+    };
+    let mut io = SysIo {
+        cwd: String::from("/Users/user"),
+    };
+    vch::run(&mut io, &info);
+}
+
+impl ShellIo for SysIo {
+    fn write_str(&mut self, text: &str) {
+        let _ = write(FD_STDOUT, text.as_bytes());
+    }
+
+    fn clear(&mut self) {
+        let _ = write(FD_STDOUT, b"\x1b[2J\x1b[H");
+    }
+
+    fn backspace(&mut self) {
+        let _ = write(FD_STDOUT, b"\x08");
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        let mut buf = [0u8; 1];
+        loop {
+            let n = read(0, &mut buf);
+            if n > 0 {
+                return buf[0];
+            }
+            vlr_libc::yield_now();
+        }
+    }
+
+    fn ticks(&mut self) -> u64 {
+        getticks()
+    }
+
+    fn memory(&mut self) -> MemorySnapshot {
+        let mut info = MemInfo {
+            frames_total: 0,
+            frames_used: 0,
+            frames_free: 0,
+            heap_total: 0,
+            heap_used: 0,
+            heap_free: 0,
+        };
+        let _ = memstat(&mut info);
+        MemorySnapshot {
+            frames_total: info.frames_total,
+            frames_used: info.frames_used,
+            frames_free: info.frames_free,
+            heap_total: info.heap_total,
+            heap_used: info.heap_used,
+            heap_free: info.heap_free,
+        }
+    }
+
+    fn tasks(&mut self) -> Vec<TaskSnapshot> {
+        let mut recs = [TaskRec {
+            id: 0,
+            ticks: 0,
+            user: 0,
+            name: [0; 16],
+            state: [0; 16],
+        }; 32];
+        let count = taskstat(&mut recs).max(0) as usize;
+        recs[..count]
+            .iter()
+            .map(|rec| TaskSnapshot {
+                id: rec.id,
+                name: cstr(&rec.name),
+                mode: if rec.user == 1 { "user" } else { "kernel" },
+                state: state_name(&rec.state),
+                ticks: rec.ticks,
+            })
+            .collect()
+    }
+
+    fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str> {
+        let id = kspawn(name);
+        if id < 0 {
+            Err("unknown task")
+        } else {
+            Ok(id as u64)
+        }
+    }
+
+    fn kill_task(&mut self, id: u64) -> Result<(), &'static str> {
+        if kill(id) < 0 {
+            Err("kill failed")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn run_user(&mut self, name: &str) -> Result<u64, &'static str> {
+        self.exec(&alloc::format!("/Apps/{name}/{name}.vlr"))
+    }
+
+    fn current_dir(&mut self) -> String {
+        self.cwd.clone()
+    }
+
+    fn change_dir(&mut self, path: &str) {
+        self.cwd = String::from(path);
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>, &'static str> {
+        let fd = open(path);
+        if fd < 0 {
+            return Err("not found");
+        }
+        let mut names = Vec::new();
+        let mut index = 0u64;
+        loop {
+            let mut buf = [0u8; 64];
+            let n = readdir(fd as u64, index, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            names.push(String::from(core::str::from_utf8(&buf[..n as usize]).unwrap_or("?")));
+            index += 1;
+            if index > 128 {
+                break;
+            }
+        }
+        let _ = close(fd as u64);
+        Ok(names)
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, &'static str> {
+        let fd = open(path);
+        if fd < 0 {
+            return Err("not found");
+        }
+        let mut out = Vec::new();
+        loop {
+            let mut buf = [0u8; 256];
+            let n = read(fd as u64, &mut buf);
+            if n < 0 {
+                let _ = close(fd as u64);
+                return Err("io error");
+            }
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+            if out.len() > 64 * 1024 {
+                break;
+            }
+        }
+        let _ = close(fd as u64);
+        Ok(out)
+    }
+
+    fn exec(&mut self, path: &str) -> Result<u64, &'static str> {
+        match exec(path) {
+            -2 => Err("rejected"),
+            id if id < 0 => Err("not found"),
+            id => Ok(id as u64),
+        }
+    }
+}
+
+fn cstr(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    String::from(core::str::from_utf8(&bytes[..end]).unwrap_or("?"))
+}
+
+fn state_name(bytes: &[u8]) -> &'static str {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    match core::str::from_utf8(&bytes[..end]).unwrap_or("") {
+        "running" => "running",
+        "ready" => "ready",
+        "sleeping" => "sleeping",
+        "dead" => "dead",
+        _ => "?",
+    }
+}

@@ -31,6 +31,23 @@ enum State {
     Dead,
 }
 
+#[derive(Clone, Copy)]
+struct Fd {
+    used: bool,
+    inode: u64,
+    pos: u64,
+}
+
+impl Fd {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            inode: 0,
+            pos: 0,
+        }
+    }
+}
+
 struct Task {
     id: u64,
     name: [u8; NAME_CAP],
@@ -45,6 +62,9 @@ struct Task {
     kstack_top: u64,
     cr3: u64,
     user: bool,
+    user_ip: u64,
+    user_sp: u64,
+    fds: [Fd; 8],
 }
 
 impl Task {
@@ -63,6 +83,9 @@ impl Task {
             kstack_top: 0,
             cr3: 0,
             user: false,
+            user_ip: 0,
+            user_sp: 0,
+            fds: [const { Fd::empty() }; 8],
         }
     }
 }
@@ -159,6 +182,9 @@ pub fn init() {
             kstack_top: 0,
             cr3: 0,
             user: false,
+            user_ip: 0,
+            user_sp: 0,
+            fds: [const { Fd::empty() }; 8],
         };
         table.current = 0;
         table.next_id = 1;
@@ -173,6 +199,102 @@ pub fn ticks() -> u64 {
 
 pub fn spawn(name: &str, entry: fn()) -> Result<TaskId, SchedError> {
     interrupts::without_interrupts(|| unsafe { spawn_locked(name, entry) })
+}
+
+pub fn spawn_user(
+    name: &str,
+    entry: fn(),
+    cr3: u64,
+    user_ip: u64,
+    user_sp: u64,
+) -> Result<TaskId, SchedError> {
+    interrupts::without_interrupts(|| unsafe {
+        let id = spawn_locked(name, entry)?;
+        let table = table();
+        if let Some(task) = table.tasks.iter_mut().find(|task| task.id == id.0) {
+            task.cr3 = cr3;
+            task.user = true;
+            task.user_ip = user_ip;
+            task.user_sp = user_sp;
+        }
+        Ok(id)
+    })
+}
+
+pub fn user_start() -> (u64, u64, u64) {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &table.tasks[table.current];
+        (task.user_ip, task.user_sp, task.kstack_top)
+    })
+}
+
+pub fn current_cr3() -> u64 {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        table.tasks[table.current].cr3
+    })
+}
+
+pub fn alive(id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        table().tasks.iter().any(|task| {
+            task.id == id && task.state != State::Empty && task.state != State::Dead
+        })
+    })
+}
+
+pub fn fd_open(inode: u64) -> Option<u64> {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &mut table.tasks[table.current];
+        for (index, slot) in task.fds.iter_mut().enumerate().skip(2) {
+            if !slot.used {
+                *slot = Fd {
+                    used: true,
+                    inode,
+                    pos: 0,
+                };
+                return Some(index as u64);
+            }
+        }
+        None
+    })
+}
+
+pub fn fd_read(fd: u64) -> Option<(u64, u64)> {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &table.tasks[table.current];
+        let slot = task.fds.get(fd as usize)?;
+        if slot.used { Some((slot.inode, slot.pos)) } else { None }
+    })
+}
+
+pub fn fd_advance(fd: u64, pos: u64) {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &mut table.tasks[table.current];
+        if let Some(slot) = task.fds.get_mut(fd as usize) {
+            if slot.used {
+                slot.pos = pos;
+            }
+        }
+    });
+}
+
+pub fn fd_close(fd: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &mut table.tasks[table.current];
+        if let Some(slot) = task.fds.get_mut(fd as usize) {
+            if slot.used && fd >= 2 {
+                *slot = Fd::empty();
+                return true;
+            }
+        }
+        false
+    })
 }
 
 pub fn yield_now() {

@@ -3,6 +3,10 @@ name = "vlr-loader"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Draft .vlr header, application paths, and the future executable loader"
+description = ".vlr format and the ring-3 loader"
 
 [dependencies]
+vlr-arch = { path = "../arch" }
+vlr-memory = { path = "../memory" }
+vlr-sched = { path = "../sched" }
+vlr-vfs = { path = "../vfs" }

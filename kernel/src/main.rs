@@ -92,20 +92,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     vlr_drivers::keyboard::init();
     vlr_drivers::serial::enable_rx_irq();
     vlr_syscall::init();
-    let _vfs = vlr_vfs::init();
-    vlr_btrfs::init();
+    #[cfg(feature = "shell")]
+    vlr_syscall::set_demo_spawner(spawn_named);
     vlr_loader::init();
+    mount_disk();
     vlr_drivers::serial::write_str("diag: devices armed\n");
 
     USABLE_MEMORY.store(memory.usable_bytes(), core::sync::atomic::Ordering::Relaxed);
     print_banner(memory.usable_bytes());
 
-    #[cfg(feature = "shell")]
-    {
-        let _ = vlr_sched::spawn("vch", vch_task);
-        let _ = vlr_sched::spawn("ticker", ticker_task);
-        let _ = vlr_sched::spawn("spinner", spinner_task);
-    }
+    #[cfg(all(feature = "shell", not(feature = "boot-test")))]
+    start_shell();
 
     vlr_arch::enable_interrupts();
 
@@ -121,7 +118,7 @@ fn print_banner(usable_bytes: u64) {
     vlr_console::println!("{OS_NAME}");
     vlr_console::set_color(0x00E7E2D6);
     vlr_console::println!("VLR kernel {OS_VERSION}");
-    vlr_console::println!("x86-64 multitasking");
+    vlr_console::println!("x86-64 ring 3");
     let mib = usable_bytes / (1024 * 1024);
     vlr_console::println!("usable memory: {mib} MiB");
     vlr_console::println!();
@@ -155,6 +152,7 @@ fn boot_test() -> ! {
     paging_checks();
     sched_checks();
     user_checks();
+    disk_checks();
 
     const FAULT_ADDR: u64 = 0xFFFF_8200_0000_0000;
     vlr_arch::set_page_fault_hook(on_test_fault);
@@ -338,6 +336,56 @@ fn user_checks() {
     vlr_console::println!("user-bad-ok");
 }
 
+fn mount_disk() {
+    match vlr_drivers::ata::init() {
+        Ok(()) => match vlr_vfs::mount() {
+            Ok(()) => vlr_console::println!("btrfs-ok"),
+            Err(_) => vlr_console::println!("btrfs-failed"),
+        },
+        Err(_) => vlr_console::println!("ata-failed"),
+    }
+}
+
+#[cfg(feature = "boot-test")]
+fn disk_checks() {
+    match vlr_vfs::read_file("/Users/user/motd") {
+        Ok(bytes) if bytes == b"vlr-motd\n" => vlr_console::println!("motd-ok"),
+        Ok(_) => fail("motd-bad"),
+        Err(_) => fail("motd-bad"),
+    }
+    match vlr_vfs::list_dir("/Apps") {
+        Ok(names) if names.iter().any(|name| name == "vch") && names.iter().any(|name| name == "badfmt") => {
+            vlr_console::println!("apps-ok");
+        }
+        Ok(_) => fail("apps-missing"),
+        Err(_) => fail("apps-bad"),
+    }
+    match vlr_loader::exec_path("/Apps/vch/vch.vlr") {
+        Ok(pid) => vlr_console::println!("vch-loaded pid={pid}"),
+        Err(err) => {
+            vlr_console::println!("vch-load-fail {err:?}");
+            fail("vch-load");
+        }
+    }
+    vlr_sched::sleep(40);
+    inject("ls /Apps\n");
+    vlr_sched::sleep(80);
+    inject("cat /Users/user/motd\n");
+    vlr_sched::sleep(80);
+    inject("/Apps/hello/hello.vlr\n");
+    vlr_sched::sleep(80);
+    inject("/Apps/badfmt/badfmt.vlr\n");
+    vlr_sched::sleep(80);
+    vlr_console::println!("disk-shell-ok");
+}
+
+#[cfg(feature = "boot-test")]
+fn inject(line: &str) {
+    for byte in line.bytes() {
+        vlr_drivers::input::push(byte);
+    }
+}
+
 fn on_user_fault(addr: u64, kind: &'static str) -> ! {
     let id = vlr_sched::current_id();
     vlr_console::println!("user fault: {kind} pid={id} addr={addr:#x}");
@@ -362,6 +410,19 @@ fn log_exception(message: &str) {
     let _ = vlr_drivers::display::try_write_str(message);
 }
 
+#[cfg(all(feature = "shell", not(feature = "boot-test")))]
+fn start_shell() {
+    let _ = vlr_sched::spawn("ticker", ticker_task);
+    let _ = vlr_sched::spawn("spinner", spinner_task);
+    match vlr_loader::exec_path("/Apps/vch/vch.vlr") {
+        Ok(pid) => vlr_console::println!("vch-loaded pid={pid}"),
+        Err(err) => {
+            vlr_console::println!("vch-fallback {err:?}");
+            let _ = vlr_sched::spawn("vch", vch_task);
+        }
+    }
+}
+
 #[cfg(feature = "shell")]
 fn vch_task() {
     let info = vch::ShellInfo {
@@ -372,7 +433,9 @@ fn vch_task() {
         home_display: vlr_loader::HOME_DISPLAY,
         home_path: vlr_loader::HOME_PATH,
     };
-    let mut shell = KernelShell;
+    let mut shell = KernelShell {
+        cwd: alloc::string::String::from(vlr_loader::HOME_PATH),
+    };
     vch::run(&mut shell, &info);
 }
 
@@ -403,7 +466,9 @@ fn spawn_named(name: &str) -> Result<u64, &'static str> {
 }
 
 #[cfg(feature = "shell")]
-struct KernelShell;
+struct KernelShell {
+    cwd: alloc::string::String,
+}
 
 #[cfg(feature = "shell")]
 impl vch::ShellIo for KernelShell {
@@ -466,6 +531,42 @@ impl vch::ShellIo for KernelShell {
 
     fn run_user(&mut self, name: &str) -> Result<u64, &'static str> {
         userland::launch_named(name)
+    }
+
+    fn current_dir(&mut self) -> alloc::string::String {
+        self.cwd.clone()
+    }
+
+    fn change_dir(&mut self, path: &str) {
+        self.cwd = alloc::string::String::from(path);
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+        vlr_vfs::list_dir(path).map_err(vfs_err)
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+        vlr_vfs::read_file(path).map_err(vfs_err)
+    }
+
+    fn exec(&mut self, path: &str) -> Result<u64, &'static str> {
+        match vlr_loader::exec_path(path) {
+            Ok(id) => Ok(id),
+            Err(vlr_loader::LoadError::BadImage | vlr_loader::LoadError::Unsupported) => {
+                Err("rejected")
+            }
+            Err(_) => Err("not found"),
+        }
+    }
+}
+
+#[cfg(feature = "shell")]
+fn vfs_err(err: vlr_vfs::VfsError) -> &'static str {
+    match err {
+        vlr_vfs::VfsError::NotFound => "not found",
+        vlr_vfs::VfsError::NotDirectory => "not a directory",
+        vlr_vfs::VfsError::Compressed => "compressed",
+        _ => "io error",
     }
 }
 
