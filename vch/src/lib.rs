@@ -50,6 +50,26 @@ pub trait ShellIo {
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>, &'static str>;
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, &'static str>;
     fn exec(&mut self, path: &str) -> Result<u64, &'static str>;
+    fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), &'static str> {
+        let _ = (path, data);
+        Err("read only")
+    }
+    fn create_file(&mut self, path: &str) -> Result<(), &'static str> {
+        let _ = path;
+        Err("read only")
+    }
+    fn make_dir(&mut self, path: &str) -> Result<(), &'static str> {
+        let _ = path;
+        Err("read only")
+    }
+    fn remove_path(&mut self, path: &str) -> Result<(), &'static str> {
+        let _ = path;
+        Err("read only")
+    }
+    fn rename_path(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
+        let _ = (from, to);
+        Err("read only")
+    }
 }
 
 pub struct ShellInfo {
@@ -63,6 +83,7 @@ pub struct ShellInfo {
 
 pub fn run<I: ShellIo>(io: &mut I, info: &ShellInfo) -> ! {
     let mut history = Vec::new();
+    load_saved(io, &mut history);
     loop {
         let cwd = io.current_dir();
         let shown = if cwd == info.home_path {
@@ -80,7 +101,46 @@ pub fn run<I: ShellIo>(io: &mut I, info: &ShellInfo) -> ! {
         }
         history.push(line.clone());
         dispatch(io, info, &line, &history);
+        save_state(io, &history);
     }
+}
+
+fn load_saved<I: ShellIo>(io: &mut I, history: &mut Vec<String>) {
+    if let Ok(bytes) = io.read_file("/AppData/vch/history") {
+        if let Ok(text) = core::str::from_utf8(&bytes) {
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                if history.len() == HISTORY_LIMIT {
+                    history.remove(0);
+                }
+                history.push(String::from(line));
+            }
+        }
+    }
+    if let Ok(bytes) = io.read_file("/AppData/vch/settings") {
+        if let Ok(text) = core::str::from_utf8(&bytes) {
+            for line in text.lines() {
+                if let Some(cwd) = line.strip_prefix("cwd=") {
+                    if io.list_dir(cwd).is_ok() {
+                        io.change_dir(cwd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn save_state<I: ShellIo>(io: &mut I, history: &[String]) {
+    let mut text = String::new();
+    for line in history {
+        text.push_str(line);
+        text.push('\n');
+    }
+    let _ = io.write_file("/AppData/vch/history", text.as_bytes());
+    let settings = alloc::format!("cwd={}\n", io.current_dir());
+    let _ = io.write_file("/AppData/vch/settings", settings.as_bytes());
 }
 
 pub fn write_prompt<I: ShellIo>(io: &mut I, username: &str, cwd: &str) {
@@ -168,13 +228,31 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  ls       list a directory\n  \
                  cat      print a file\n  \
                  cd       change directory\n  \
+                 touch    create an empty file\n  \
+                 mkdir    create a directory\n  \
+                 rm       remove a file or empty directory\n  \
+                 mv       rename a file or directory\n  \
+                 write    write text into a file\n  \
                  run      run a .vlr by name or path\n",
             );
         }
         "clear" => io.clear(),
         "echo" => {
-            io.write_str(rest);
-            io.write_str("\n");
+            if let Some((text, path, append)) = split_redirect(rest) {
+                let path = io_path(io, info, path);
+                let mut body = if append {
+                    io.read_file(&path).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                body.extend_from_slice(text.as_bytes());
+                body.push(b'\n');
+                let result = io.write_file(&path, &body);
+                report(io, result);
+            } else {
+                io.write_str(rest);
+                io.write_str("\n");
+            }
         }
         "version" => {
             io.write_str(info.os_name);
@@ -277,6 +355,48 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                 }
             }
         }
+        "touch" => {
+            let path = io_path(io, info, rest);
+            let result = io.create_file(&path);
+            report(io, result);
+        }
+        "mkdir" => {
+            let path = io_path(io, info, rest);
+            let result = io.make_dir(&path);
+            report(io, result);
+        }
+        "rm" => {
+            let path = io_path(io, info, rest);
+            let result = io.remove_path(&path);
+            report(io, result);
+        }
+        "mv" => {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let from = parts.next().unwrap_or("");
+            let to = parts.next().unwrap_or("").trim();
+            if from.is_empty() || to.is_empty() {
+                io.write_str("mv failed\n");
+            } else {
+                let from = io_path(io, info, from);
+                let to = io_path(io, info, to);
+                let result = io.rename_path(&from, &to);
+                report(io, result);
+            }
+        }
+        "write" => {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let path = parts.next().unwrap_or("");
+            let text = parts.next().unwrap_or("");
+            if path.is_empty() {
+                io.write_str("write failed\n");
+            } else {
+                let path = io_path(io, info, path);
+                let mut body = text.as_bytes().to_vec();
+                body.push(b'\n');
+                let result = io.write_file(&path, &body);
+                report(io, result);
+            }
+        }
         "cd" => {
             let path = if rest.is_empty() {
                 String::from(info.home_path)
@@ -312,6 +432,23 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                 }
             }
         }
+    }
+}
+
+fn report<I: ShellIo>(io: &mut I, result: Result<(), &'static str>) {
+    if let Err(err) = result {
+        io.write_str(err);
+        io.write_str("\n");
+    }
+}
+
+fn split_redirect(rest: &str) -> Option<(&str, &str, bool)> {
+    if let Some(index) = rest.rfind(" >> ") {
+        Some((rest[..index].trim(), rest[index + 4..].trim(), true))
+    } else if let Some(index) = rest.rfind(" > ") {
+        Some((rest[..index].trim(), rest[index + 3..].trim(), false))
+    } else {
+        None
     }
 }
 

@@ -118,7 +118,7 @@ fn print_banner(usable_bytes: u64) {
     vlr_console::println!("{OS_NAME}");
     vlr_console::set_color(0x00E7E2D6);
     vlr_console::println!("VLR kernel {OS_VERSION}");
-    vlr_console::println!("x86-64 ring 3");
+    vlr_console::println!("x86-64 btrfs");
     let mib = usable_bytes / (1024 * 1024);
     vlr_console::println!("usable memory: {mib} MiB");
     vlr_console::println!();
@@ -549,6 +549,26 @@ impl vch::ShellIo for KernelShell {
         vlr_vfs::read_file(path).map_err(vfs_err)
     }
 
+    fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), &'static str> {
+        vlr_vfs::write_file(path, data).map_err(vfs_err)
+    }
+
+    fn create_file(&mut self, path: &str) -> Result<(), &'static str> {
+        vlr_vfs::create_file(path).map_err(vfs_err)
+    }
+
+    fn make_dir(&mut self, path: &str) -> Result<(), &'static str> {
+        vlr_vfs::make_dir(path).map_err(vfs_err)
+    }
+
+    fn remove_path(&mut self, path: &str) -> Result<(), &'static str> {
+        vlr_vfs::remove_path(path).map_err(vfs_err)
+    }
+
+    fn rename_path(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
+        vlr_vfs::rename_path(from, to).map_err(vfs_err)
+    }
+
     fn exec(&mut self, path: &str) -> Result<u64, &'static str> {
         match vlr_loader::exec_path(path) {
             Ok(id) => Ok(id),
@@ -566,6 +586,9 @@ fn vfs_err(err: vlr_vfs::VfsError) -> &'static str {
         vlr_vfs::VfsError::NotFound => "not found",
         vlr_vfs::VfsError::NotDirectory => "not a directory",
         vlr_vfs::VfsError::Compressed => "compressed",
+        vlr_vfs::VfsError::ReadOnly => "read only",
+        vlr_vfs::VfsError::Exists => "exists",
+        vlr_vfs::VfsError::NotEmpty => "not empty",
         _ => "io error",
     }
 }

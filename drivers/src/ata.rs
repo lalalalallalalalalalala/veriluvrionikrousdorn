@@ -114,6 +114,49 @@ impl AtaDisk {
         }
         Ok(())
     }
+
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if lba >= self.sectors || buf.len() < SECTOR {
+            return Err(BlockError::OutOfRange);
+        }
+        wait_not_busy()?;
+        unsafe {
+            let head = 0xF0 | ((lba >> 24) as u8 & 0x0F);
+            Port::<u8>::new(DRIVE).write(head);
+            Port::<u8>::new(SECTOR_COUNT).write(1);
+            Port::<u8>::new(LBA_LO).write(lba as u8);
+            Port::<u8>::new(LBA_MID).write((lba >> 8) as u8);
+            Port::<u8>::new(LBA_HI).write((lba >> 16) as u8);
+            Port::<u8>::new(COMMAND).write(0x30);
+        }
+        wait_drq()?;
+        unsafe {
+            let mut data = Port::<u16>::new(DATA);
+            for i in 0..256 {
+                let word = u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+                data.write(word);
+            }
+        }
+        wait_not_busy()?;
+        if status() & ERR != 0 {
+            return Err(BlockError::Io);
+        }
+        Ok(())
+    }
+
+    fn flush_cache(&mut self) -> Result<(), BlockError> {
+        wait_not_busy()?;
+        unsafe {
+            Port::<u8>::new(DRIVE).write(0xF0);
+            Port::<u8>::new(COMMAND).write(0xE7);
+        }
+        wait_not_busy()?;
+        if status() & ERR != 0 {
+            Err(BlockError::Io)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl BlockDevice for AtaDisk {
@@ -136,8 +179,22 @@ impl BlockDevice for AtaDisk {
         }
         Ok(())
     }
-    fn write_blocks(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
-        Err(BlockError::Unsupported)
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.len() % SECTOR != 0 {
+            return Err(BlockError::Io);
+        }
+        let mut offset = 0;
+        let mut sector = lba;
+        while offset < buf.len() {
+            self.write_sector(sector, &buf[offset..offset + SECTOR])?;
+            offset += SECTOR;
+            sector += 1;
+        }
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), BlockError> {
+        self.flush_cache()
     }
 }
 

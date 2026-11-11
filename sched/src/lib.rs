@@ -36,6 +36,8 @@ struct Fd {
     used: bool,
     inode: u64,
     pos: u64,
+    writable: bool,
+    append: bool,
 }
 
 impl Fd {
@@ -44,6 +46,8 @@ impl Fd {
             used: false,
             inode: 0,
             pos: 0,
+            writable: false,
+            append: false,
         }
     }
 }
@@ -244,7 +248,14 @@ pub fn alive(id: u64) -> bool {
     })
 }
 
-pub fn fd_open(inode: u64) -> Option<u64> {
+pub struct FdMeta {
+    pub inode: u64,
+    pub pos: u64,
+    pub writable: bool,
+    pub append: bool,
+}
+
+pub fn fd_open(inode: u64, writable: bool, append: bool) -> Option<u64> {
     interrupts::without_interrupts(|| unsafe {
         let table = table();
         let task = &mut table.tasks[table.current];
@@ -254,11 +265,31 @@ pub fn fd_open(inode: u64) -> Option<u64> {
                     used: true,
                     inode,
                     pos: 0,
+                    writable,
+                    append,
                 };
                 return Some(index as u64);
             }
         }
         None
+    })
+}
+
+pub fn fd_meta(fd: u64) -> Option<FdMeta> {
+    interrupts::without_interrupts(|| unsafe {
+        let table = table();
+        let task = &table.tasks[table.current];
+        let slot = task.fds.get(fd as usize)?;
+        if slot.used {
+            Some(FdMeta {
+                inode: slot.inode,
+                pos: slot.pos,
+                writable: slot.writable,
+                append: slot.append,
+            })
+        } else {
+            None
+        }
     })
 }
 

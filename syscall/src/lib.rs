@@ -14,8 +14,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use vlr_arch::syscall_entry::SyscallFrame;
 use vlr_libc::{
     FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_GETPID, SYS_GETTICKS, SYS_KILL,
-    SYS_KSPAWN, SYS_MEMSTAT, SYS_OPEN, SYS_READ, SYS_READDIR, SYS_SLEEP, SYS_TASKSTAT, SYS_WAIT,
-    SYS_WRITE, SYS_YIELD, TaskRec,
+    SYS_FSYNC, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_READDIR, SYS_RENAME,
+    SYS_SLEEP, SYS_TASKSTAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SYS_YIELD, O_APPEND, O_CREAT, O_RDWR,
+    O_TRUNC, O_WRONLY, TaskRec, TwoPaths,
 };
 
 static DEMO: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +26,9 @@ pub fn set_demo_spawner(spawn: fn(&str) -> Result<u64, &'static str>) {
 }
 
 const FAULT: u64 = (-1i64) as u64;
+const EROFS: u64 = (-3i64) as u64;
+const EEXIST: u64 = (-4i64) as u64;
+const ENOTEMPTY: u64 = (-5i64) as u64;
 
 pub fn init() {
     vlr_arch::set_syscall_handler(handle);
@@ -57,7 +61,7 @@ fn dispatch(number: u64, a: u64, b: u64, c: u64) -> u64 {
         }
         SYS_GETPID => vlr_sched::current_id(),
         SYS_GETTICKS => vlr_drivers::timer::ticks(),
-        SYS_OPEN => sys_open(a, b),
+        SYS_OPEN => sys_open(a, b, c),
         SYS_CLOSE => {
             if vlr_sched::fd_close(a) {
                 0
@@ -80,13 +84,17 @@ fn dispatch(number: u64, a: u64, b: u64, c: u64) -> u64 {
             Err(_) => FAULT,
         },
         SYS_KSPAWN => sys_kspawn(a, b),
+        SYS_MKDIR => sys_path(a, b, vlr_btrfs::make_dir),
+        SYS_UNLINK => sys_path(a, b, vlr_btrfs::remove_path),
+        SYS_RENAME => sys_rename(a),
+        SYS_FSYNC => 0,
         _ => FAULT,
     }
 }
 
 fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
     if fd != FD_STDOUT {
-        return FAULT;
+        return sys_write_file(fd, ptr, len);
     }
     let len = len.min(4096) as usize;
     if !vlr_memory::is_user_range(ptr, len) {
@@ -175,15 +183,94 @@ fn sys_read_file(fd: u64, ptr: u64, len: u64) -> u64 {
     n as u64
 }
 
-fn sys_open(ptr: u64, len: u64) -> u64 {
+fn sys_open(ptr: u64, len: u64, flags: u64) -> u64 {
     let Some(path) = user_string(ptr, len) else {
         return FAULT;
     };
-    let inode = match vlr_btrfs::lookup_inode(&path) {
-        Ok(inode) => inode,
-        Err(_) => return FAULT,
+    let writable = flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0;
+    if writable && !vlr_btrfs::may_write(&path) {
+        return EROFS;
+    }
+    let mut inode = vlr_btrfs::lookup_inode(&path);
+    if inode.is_err() && flags & O_CREAT != 0 {
+        if let Err(err) = vlr_btrfs::create_file(&path) {
+            return btrfs_code(err);
+        }
+        inode = vlr_btrfs::lookup_inode(&path);
+    }
+    let Ok(inode) = inode else {
+        return FAULT;
     };
-    vlr_sched::fd_open(inode).unwrap_or(FAULT)
+    if flags & O_TRUNC != 0 {
+        if let Err(err) = vlr_btrfs::write_inode(inode, 0, &[], false, true) {
+            return btrfs_code(err);
+        }
+    }
+    vlr_sched::fd_open(inode, writable, flags & O_APPEND != 0).unwrap_or(FAULT)
+}
+
+fn sys_write_file(fd: u64, ptr: u64, len: u64) -> u64 {
+    let Some(meta) = vlr_sched::fd_meta(fd) else {
+        return FAULT;
+    };
+    if !meta.writable {
+        return EROFS;
+    }
+    let len = len.min(4096) as usize;
+    if len == 0 {
+        return 0;
+    }
+    if !vlr_memory::is_user_range(ptr, len) {
+        return FAULT;
+    }
+    let mut buf = alloc::vec![0u8; len];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
+    }
+    if vlr_btrfs::write_inode(meta.inode, meta.pos, &buf, meta.append, false).is_err() {
+        return FAULT;
+    }
+    if !meta.append {
+        vlr_sched::fd_advance(fd, meta.pos + len as u64);
+    }
+    len as u64
+}
+
+fn sys_path(ptr: u64, len: u64, op: fn(&str) -> Result<(), vlr_btrfs::BtrfsError>) -> u64 {
+    let Some(path) = user_string(ptr, len) else {
+        return FAULT;
+    };
+    match op(&path) {
+        Ok(()) => 0,
+        Err(err) => btrfs_code(err),
+    }
+}
+
+fn sys_rename(ptr: u64) -> u64 {
+    let size = core::mem::size_of::<TwoPaths>();
+    if !vlr_memory::is_user_range(ptr, size) {
+        return FAULT;
+    }
+    let args = unsafe { core::ptr::read(ptr as *const TwoPaths) };
+    let Some(from) = user_string(args.first, args.first_len) else {
+        return FAULT;
+    };
+    let Some(to) = user_string(args.second, args.second_len) else {
+        return FAULT;
+    };
+    match vlr_btrfs::rename_path(&from, &to) {
+        Ok(()) => 0,
+        Err(err) => btrfs_code(err),
+    }
+}
+
+fn btrfs_code(err: vlr_btrfs::BtrfsError) -> u64 {
+    match err {
+        vlr_btrfs::BtrfsError::ReadOnly => EROFS,
+        vlr_btrfs::BtrfsError::Exists => EEXIST,
+        vlr_btrfs::BtrfsError::NotEmpty => ENOTEMPTY,
+        _ => FAULT,
+    }
 }
 
 fn sys_readdir(fd: u64, index: u64, ptr: u64) -> u64 {

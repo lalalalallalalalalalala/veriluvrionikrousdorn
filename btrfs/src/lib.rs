@@ -1,4 +1,8 @@
-//! Btrfs только для чтения.
+//! Btrfs: чтение и копирующая запись.
+//!
+//! Запись не затирает живые блоки. Новые узлы деревьев пишутся первыми,
+//! суперблок — последним, поэтому обрыв посередине оставляет прежнее
+//! согласованное состояние. Сжатый экстент по-прежнему ошибка.
 //!
 //! Разбираются суперблок, массив системных чанков и дерево чанков (логический
 //! адрес в физический), корневое дерево, дерево файлов, каталоги, иноды и
@@ -8,6 +12,8 @@
 #![no_std]
 
 extern crate alloc;
+
+mod commit;
 
 use alloc::vec::Vec;
 use vlr_drivers::block::{BlockDevice, BlockError};
@@ -31,6 +37,11 @@ pub enum BtrfsError {
     BadMagic,
     NotFound,
     NotDirectory,
+    NotFile,
+    NotEmpty,
+    Exists,
+    ReadOnly,
+    InvalidPath,
     Compressed,
     Unsupported,
 }
@@ -451,6 +462,62 @@ pub fn list_inode(inode: u64) -> Result<Vec<alloc::string::String>, BtrfsError> 
     })
 }
 
+pub(crate) fn apply<R>(
+    vol: &mut Volume,
+    disk: &mut dyn BlockDevice,
+    superblock: bool,
+    f: impl FnOnce(&mut commit::Tx, &Volume, &mut dyn BlockDevice) -> Result<R, BtrfsError>,
+) -> Result<R, BtrfsError> {
+    let mut tx = commit::open(vol, disk)?;
+    let value = f(&mut tx, vol, disk)?;
+    if tx.dirty {
+        let root = tx.commit(vol, disk, superblock)?;
+        if superblock {
+            vol.fs_root = root;
+        }
+    }
+    Ok(value)
+}
+
+fn mutate<R>(
+    f: impl FnOnce(&mut commit::Tx, &Volume, &mut dyn BlockDevice) -> Result<R, BtrfsError>,
+) -> Result<R, BtrfsError> {
+    let mut guard = VOLUME.lock();
+    let vol = guard.as_mut().ok_or(BtrfsError::NotFound)?;
+    disk(|disk| {
+        let mut tx = commit::open(vol, disk)?;
+        let value = f(&mut tx, vol, disk)?;
+        if tx.dirty {
+            vol.fs_root = tx.commit(vol, disk, true)?;
+        }
+        Ok(value)
+    })
+}
+
+pub fn may_write(path: &str) -> bool {
+    commit::may_write(path)
+}
+
+pub fn create_file(path: &str) -> Result<(), BtrfsError> {
+    mutate(|tx, _, _| tx.create_file(path))
+}
+
+pub fn make_dir(path: &str) -> Result<(), BtrfsError> {
+    mutate(|tx, _, _| tx.mkdir(path))
+}
+
+pub fn remove_path(path: &str) -> Result<(), BtrfsError> {
+    mutate(|tx, _, _| tx.unlink(path))
+}
+
+pub fn rename_path(from: &str, to: &str) -> Result<(), BtrfsError> {
+    mutate(|tx, _, _| tx.rename(from, to))
+}
+
+pub fn write_inode(inode: u64, offset: u64, data: &[u8], append: bool, truncate: bool) -> Result<(), BtrfsError> {
+    mutate(|tx, vol, disk| tx.write_at(vol, disk, inode, offset, data, append, truncate))
+}
+
 pub fn list_path(path: &str) -> Result<Vec<alloc::string::String>, BtrfsError> {
     let guard = VOLUME.lock();
     let vol = guard.as_ref().ok_or(BtrfsError::NotFound)?;
@@ -497,8 +564,13 @@ mod tests {
             buf.copy_from_slice(&self.0[off..off + buf.len()]);
             Ok(())
         }
-        fn write_blocks(&mut self, _: u64, _: &[u8]) -> Result<(), BlockError> {
-            Err(BlockError::Unsupported)
+        fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+            let off = (lba as usize) * 512;
+            if off + buf.len() > self.0.len() {
+                return Err(BlockError::OutOfRange);
+            }
+            self.0[off..off + buf.len()].copy_from_slice(buf);
+            Ok(())
         }
     }
 
@@ -554,5 +626,66 @@ mod tests {
             .read_file(&mut disk, bulky_ino, 100, &mut bulky_out[..50])
             .unwrap();
         assert_eq!(n, 50);
+    }
+
+    #[test]
+    fn writes_survive_btrfs_check_and_a_torn_commit() {
+        let root = std::env::temp_dir().join("vlr-btrfs-write-root");
+        let image = std::env::temp_dir().join("vlr-btrfs-write.img");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Users/user")).unwrap();
+        std::fs::create_dir_all(root.join("AppData/vch")).unwrap();
+        std::fs::write(root.join("Users/user/motd"), b"vlr-motd\n").unwrap();
+        std::fs::write(&image, std::vec![0u8; 32 * 1024 * 1024]).unwrap();
+        let status = Command::new("mkfs.btrfs")
+            .args([
+                "-q", "-f", "-m", "single", "-d", "single", "-r",
+                root.to_str().unwrap(), "--shrink", image.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut disk = MemDisk(std::fs::read(&image).unwrap());
+        let mut vol = mount(&mut disk).unwrap();
+        apply(&mut vol, &mut disk, true, |tx, vol, disk| {
+            tx.mkdir("/Users/user/box")?;
+            tx.write_path(vol, disk, "/Users/user/box/kept", b"persist-ok", false)?;
+            tx.write_path(vol, disk, "/Users/user/box/big", &std::vec![0x11u8; 3000], false)?;
+            tx.write_path(vol, disk, "/AppData/vch/history", b"write /Users/user/kept\n", false)?;
+            tx.rename("/Users/user/box/kept", "/Users/user/box/note")?;
+            Ok(())
+        })
+        .unwrap();
+        let note = vol.lookup(&mut disk, "/Users/user/box/note").unwrap();
+        let mut buf = [0u8; 32];
+        let n = vol.read_file(&mut disk, note, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"persist-ok");
+        let big = vol.lookup(&mut disk, "/Users/user/box/big").unwrap();
+        let mut big_buf = std::vec![0u8; 3000];
+        let n = vol.read_file(&mut disk, big, 0, &mut big_buf).unwrap();
+        assert_eq!(n, 3000);
+        assert!(big_buf.iter().all(|byte| *byte == 0x11));
+        assert!(vol.lookup(&mut disk, "/Users/user/box/kept").is_err());
+        apply(&mut vol, &mut disk, true, |tx, _, _| tx.unlink("/Users/user/motd")).unwrap();
+        assert!(vol.lookup(&mut disk, "/Users/user/motd").is_err());
+
+        let torn = disk.0.clone();
+        let mut torn_disk = MemDisk(torn);
+        let mut torn_vol = mount(&mut torn_disk).unwrap();
+        apply(&mut torn_vol, &mut torn_disk, false, |tx, vol, disk| {
+            tx.write_path(vol, disk, "/Users/user/box/ghost", b"nope", false)
+        })
+        .unwrap();
+        let mut reread = MemDisk(torn_disk.0.clone());
+        let reread_vol = mount(&mut reread).unwrap();
+        assert!(reread_vol.lookup(&mut reread, "/Users/user/box/ghost").is_err());
+        assert!(reread_vol.lookup(&mut reread, "/Users/user/box/note").is_ok());
+
+        std::fs::write(&image, &disk.0).unwrap();
+        let check = Command::new("btrfs")
+            .args(["check", "--readonly", image.to_str().unwrap()])
+            .status()
+            .expect("btrfs check");
+        assert!(check.success(), "btrfs check rejected the written image");
     }
 }

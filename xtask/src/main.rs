@@ -53,6 +53,7 @@ fn run() -> Result<()> {
         }
         "test" => {
             host_tests()?;
+            persist_test()?;
             boot_test()?;
             shell_test()?;
             println!("vlr tests passed");
@@ -170,7 +171,7 @@ fn qemu(gui: bool, test_exit: bool) -> Command {
         ))
         .arg("-drive")
         .arg(format!(
-            "format=raw,if=ide,index=1,file={}",
+            "format=raw,if=ide,index=1,cache=writethrough,file={}",
             disk_path().display()
         ))
         .arg("-no-reboot");
@@ -242,7 +243,7 @@ fn boot_test() -> Result<()> {
         ))
         .arg("-drive")
         .arg(format!(
-            "format=raw,if=ide,index=1,file={}",
+            "format=raw,if=ide,index=1,cache=writethrough,file={}",
             disk_path().display()
         ))
         .arg("-display")
@@ -261,7 +262,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.5.0",
+        "VLR kernel 0.6.0",
         "btrfs-ok",
         "motd-ok",
         "apps-ok",
@@ -297,6 +298,106 @@ fn boot_test() -> Result<()> {
     }
     println!("boot test passed");
     Ok(())
+}
+
+fn persist_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
+    build_kernel(false)?;
+    make_image()?;
+    let persist = workspace_root().join("target/vlr-btrfs-persist.img");
+    fs::copy(disk_path(), &persist)?;
+    let bios = image_path();
+    run_persist_boot(&bios, &persist, true)?;
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly", persist.to_str().context("persist path")?])
+        .status()
+        .context("btrfs check")?;
+    if !check.success() {
+        bail!("btrfs check rejected the image after the kernel wrote it");
+    }
+    run_persist_boot(&bios, &persist, false)?;
+    println!("persist test passed");
+    Ok(())
+}
+
+fn run_persist_boot(bios: &std::path::Path, disk: &std::path::Path, writing: bool) -> Result<()> {
+    let serial_port = 18771u16;
+    let monitor_port = 18772u16;
+    let mut child = Command::new("qemu-system-x86_64")
+        .arg("-machine").arg("pc")
+        .arg("-accel").arg("tcg")
+        .arg("-cpu").arg("qemu64")
+        .arg("-smp").arg("1")
+        .arg("-m").arg("256M")
+        .arg("-drive").arg(format!("format=raw,if=ide,index=0,file={}", bios.display()))
+        .arg("-drive").arg(format!("format=raw,if=ide,index=1,cache=writethrough,file={}", disk.display()))
+        .arg("-display").arg("none")
+        .arg("-serial").arg(format!("tcp:127.0.0.1:{serial_port},server"))
+        .arg("-monitor").arg(format!("tcp:127.0.0.1:{monitor_port},server,nowait"))
+        .arg("-no-reboot")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(workspace_root().join("target/persist-qemu.log"))?)
+        .spawn()
+        .context("persist qemu")?;
+    let result = (|| {
+        let serial = connect_retry(("127.0.0.1", serial_port), Duration::from_secs(15))?;
+        let mut writer = serial.try_clone()?;
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_reader = Arc::clone(&captured);
+        thread::spawn(move || {
+            let mut serial = serial;
+            let mut buf = [0u8; 256];
+            loop {
+                match serial.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        captured_reader.lock().expect("serial").push_str(&text);
+                    }
+                }
+            }
+        });
+        if !wait_for(&captured, "user@::vch#~ ", Duration::from_secs(30)) {
+            bail!("persist prompt missing:\n{}", captured.lock().unwrap());
+        }
+        if writing {
+            writer.write_all(b"write /Users/user/kept persist-ok\rcat /Users/user/kept\r")?;
+            writer.flush().ok();
+            if !wait_count(&captured, "persist-ok", 2, Duration::from_secs(20)) {
+                bail!("written file missing:\n{}", captured.lock().unwrap());
+            }
+        } else {
+            writer.write_all(b"history\r")?;
+            writer.flush().ok();
+            if !wait_for(&captured, "write /Users/user/kept", Duration::from_secs(10)) {
+                bail!("history did not survive reboot:\n{}", captured.lock().unwrap());
+            }
+            writer.write_all(b"cat /Users/user/kept\r")?;
+            writer.flush().ok();
+            if !wait_for(&captured, "persist-ok", Duration::from_secs(10)) {
+                bail!("file did not survive reboot:\n{}", captured.lock().unwrap());
+            }
+            writer.write_all(b"cat /AppData/vch/settings\r")?;
+            writer.flush().ok();
+            if !wait_for(&captured, "cwd=", Duration::from_secs(10)) {
+                bail!("settings did not survive reboot:\n{}", captured.lock().unwrap());
+            }
+        }
+        Ok(())
+    })();
+    if result.is_ok() {
+        if let Ok(mut monitor) = connect_retry(("127.0.0.1", monitor_port), Duration::from_secs(5)) {
+            let _ = write!(monitor, "quit\n");
+            let _ = monitor.flush();
+            let _ = child.wait();
+            return result;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn shell_test() -> Result<()> {
@@ -618,11 +719,17 @@ fn connect_retry(addr: (&str, u16), timeout: Duration) -> Result<TcpStream> {
 }
 
 fn wait_for(captured: &Mutex<String>, needle: &str, timeout: Duration) -> bool {
+    wait_count(captured, needle, 1, timeout)
+}
+
+fn wait_count(captured: &Mutex<String>, needle: &str, times: usize, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if captured.lock().expect("serial buffer").contains(needle) {
+        let text = captured.lock().expect("serial buffer");
+        if text.matches(needle).count() >= times {
             return true;
         }
+        drop(text);
         thread::sleep(Duration::from_millis(20));
     }
     false

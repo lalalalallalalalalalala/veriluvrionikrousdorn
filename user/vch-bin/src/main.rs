@@ -7,8 +7,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use vch::{MemorySnapshot, ShellInfo, ShellIo, TaskSnapshot};
 use vlr_libc::{
-    close, exec, getticks, kill, kspawn, memstat, open, read, readdir, taskstat, write, MemInfo,
-    TaskRec, FD_STDOUT,
+    close, exec, fsync, getticks, kill, kspawn, memstat, mkdir, open, open_flags, read, readdir,
+    rename, taskstat, unlink, write, MemInfo, TaskRec, FD_STDOUT, O_CREAT, O_RDWR, O_TRUNC,
 };
 
 struct SysIo {
@@ -20,7 +20,7 @@ pub extern "C" fn _start() -> ! {
     let info = ShellInfo {
         username: "user",
         os_name: "Veriluvrionikrousdorn",
-        os_version: "0.5.0",
+        os_version: "0.6.0",
         usable_memory: 0,
         home_display: "~",
         home_path: "/Users/user",
@@ -183,6 +183,62 @@ impl ShellIo for SysIo {
             id if id < 0 => Err("not found"),
             id => Ok(id as u64),
         }
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), &'static str> {
+        let fd = open_flags(path, O_CREAT | O_TRUNC | O_RDWR);
+        if fd < 0 {
+            return Err(code_err(fd));
+        }
+        let mut done = 0usize;
+        while done < data.len() {
+            let n = write(fd as u64, &data[done..]);
+            if n < 0 {
+                let _ = close(fd as u64);
+                return Err("failed");
+            }
+            if n == 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        let _ = fsync(fd as u64);
+        let _ = close(fd as u64);
+        Ok(())
+    }
+
+    fn create_file(&mut self, path: &str) -> Result<(), &'static str> {
+        let fd = open_flags(path, O_CREAT | O_RDWR);
+        if fd < 0 {
+            return Err(code_err(fd));
+        }
+        let _ = close(fd as u64);
+        Ok(())
+    }
+
+    fn make_dir(&mut self, path: &str) -> Result<(), &'static str> {
+        code_result(mkdir(path))
+    }
+
+    fn remove_path(&mut self, path: &str) -> Result<(), &'static str> {
+        code_result(unlink(path))
+    }
+
+    fn rename_path(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
+        code_result(rename(from, to))
+    }
+}
+
+fn code_result(code: i64) -> Result<(), &'static str> {
+    if code < 0 { Err(code_err(code)) } else { Ok(()) }
+}
+
+fn code_err(code: i64) -> &'static str {
+    match code {
+        -3 => "read only",
+        -4 => "exists",
+        -5 => "not empty",
+        _ => "failed",
     }
 }
 

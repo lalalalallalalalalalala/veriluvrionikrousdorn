@@ -22,6 +22,26 @@ pub const SYS_MEMSTAT: u64 = 13;
 pub const SYS_TASKSTAT: u64 = 14;
 pub const SYS_KILL: u64 = 15;
 pub const SYS_KSPAWN: u64 = 16;
+pub const SYS_MKDIR: u64 = 17;
+pub const SYS_UNLINK: u64 = 18;
+pub const SYS_RENAME: u64 = 19;
+pub const SYS_FSYNC: u64 = 20;
+
+pub const O_RDONLY: u64 = 0;
+pub const O_WRONLY: u64 = 1;
+pub const O_RDWR: u64 = 2;
+pub const O_CREAT: u64 = 4;
+pub const O_TRUNC: u64 = 8;
+pub const O_APPEND: u64 = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TwoPaths {
+    pub first: u64,
+    pub first_len: u64,
+    pub second: u64,
+    pub second_len: u64,
+}
 
 pub const FD_STDIN: u64 = 0;
 pub const FD_STDOUT: u64 = 1;
@@ -101,7 +121,33 @@ pub fn getticks() -> u64 {
 }
 
 pub fn open(path: &str) -> i64 {
-    syscall3(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, 0) as i64
+    open_flags(path, O_RDONLY)
+}
+
+pub fn open_flags(path: &str, flags: u64) -> i64 {
+    syscall3(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags) as i64
+}
+
+pub fn mkdir(path: &str) -> i64 {
+    syscall3(SYS_MKDIR, path.as_ptr() as u64, path.len() as u64, 0) as i64
+}
+
+pub fn unlink(path: &str) -> i64 {
+    syscall3(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64, 0) as i64
+}
+
+pub fn rename(from: &str, to: &str) -> i64 {
+    let args = TwoPaths {
+        first: from.as_ptr() as u64,
+        first_len: from.len() as u64,
+        second: to.as_ptr() as u64,
+        second_len: to.len() as u64,
+    };
+    syscall1(SYS_RENAME, &args as *const TwoPaths as u64) as i64
+}
+
+pub fn fsync(fd: u64) -> i64 {
+    syscall1(SYS_FSYNC, fd) as i64
 }
 
 pub fn close(fd: u64) -> i64 {
@@ -209,6 +255,10 @@ mod tests {
             SYS_TASKSTAT,
             SYS_KILL,
             SYS_KSPAWN,
+            SYS_MKDIR,
+            SYS_UNLINK,
+            SYS_RENAME,
+            SYS_FSYNC,
         ];
         for (index, number) in nums.iter().enumerate() {
             assert_eq!(*number, (index as u64) + 1);

@@ -17,4 +17,9 @@ pub trait BlockDevice {
     fn block_count(&self) -> u64;
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
+
+    /// Сбросить кэш устройства. По умолчанию запись уже устойчива.
+    fn sync(&mut self) -> Result<(), BlockError> {
+        Ok(())
+    }
 }
