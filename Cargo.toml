@@ -4,6 +4,8 @@ members = [
     "kernel",
     "account",
     "gui",
+    "wm",
+    "user/keys",
     "arch",
     "drivers",
     "console",

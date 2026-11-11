@@ -105,9 +105,26 @@ pub fn ask(title: &str, label: &str, secret: bool) -> String {
     }
 }
 
+static CHECK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_checker(check: fn(&str) -> bool) {
+    CHECK.store(check as usize, Ordering::Relaxed);
+}
+
+pub fn refresh_apps() {
+    unsafe {
+        if let Ok(names) = vlr_vfs::list_dir("/Apps") {
+            DESK.apps = names;
+        }
+        DESK.windows[1].alive = true;
+    }
+    NEED_WINDOWS.store(true, Ordering::Relaxed);
+}
+
 pub fn desktop() -> ! {
     vlr_drivers::display::set_text_enabled(false);
     vlr_console::set_mirror(mirror);
+    vlr_wm::set_active(true);
     unsafe {
         if DESK.apps.is_empty() {
             if let Ok(names) = vlr_vfs::list_dir("/Apps") {
@@ -137,8 +154,13 @@ fn frame(cursor: &mut (i32, i32)) {
     };
     vlr_drivers::mouse::clamp(width as i32, height as i32);
     let mouse = vlr_drivers::mouse::state();
+    route_keys();
     wallpaper_rect(cursor.0, cursor.1, 16, 20);
-    let mark = term::fingerprint();
+    let mut extra = vlr_wm::focus_id();
+    for info in vlr_wm::snapshot() {
+        extra = extra.wrapping_add(info.text.len() as u64).wrapping_add(info.w as u64);
+    }
+    let mark = term::fingerprint() ^ extra;
     let clock = vlr_drivers::rtc::read();
     let stamp = clock.hour as u32 * 3600 + clock.minute as u32 * 60 + clock.second as u32;
     let dragging = unsafe { DESK.drag.is_some() };
@@ -168,9 +190,14 @@ fn frame(cursor: &mut (i32, i32)) {
     if redraw_windows {
         unsafe {
             for index in 0..DESK.windows.len() {
-            if DESK.windows[index].alive {
-                draw_window(index);
+                if DESK.windows[index].alive {
+                    draw_window(index);
+                }
             }
+        }
+        for info in vlr_wm::snapshot() {
+            if !info.minimized {
+                draw_client(&info);
             }
         }
         NEED_WINDOWS.store(false, Ordering::Relaxed);
@@ -202,10 +229,17 @@ fn wallpaper_rect(x: i32, y: i32, w: i32, h: i32) {
 }
 
 fn click(x: i32, y: i32) {
+    if hit_clients(x, y) {
+        NEED_WINDOWS.store(true, Ordering::Relaxed);
+        return;
+    }
     unsafe {
         if y < BAR_H as i32 {
-            if (110..190).contains(&x) {
+            if (168..240).contains(&x) {
                 DESK.windows[1].alive = true;
+                NEED_WINDOWS.store(true, Ordering::Relaxed);
+            } else if (248..320).contains(&x) {
+                lock_screen();
             }
             return;
         }
@@ -275,9 +309,11 @@ fn star_count(n: usize) -> String {
 fn draw_bar(width: usize) {
     vlr_drivers::display::fill_rect(0, 0, width, BAR_H, BAR);
     vlr_drivers::display::blit_solid(8, 4, logo::LOGO_W, logo::LOGO_H, &logo::LOGO, 1);
-    text(44, 12, "VLR", 0x00FFFFFF, BAR, 2);
-    vlr_drivers::display::fill_rect(110, 8, 72, 24, 0x00C4235A);
-    text(122, 14, "Apps", 0x00FFFFFF, 0x00C4235A, 1);
+    text(44, 14, "Vrlvrnkrsdrn", 0x00FFFFFF, BAR, 1);
+    vlr_drivers::display::fill_rect(168, 8, 72, 24, 0x00C4235A);
+    text(180, 14, "Apps", 0x00FFFFFF, 0x00C4235A, 1);
+    vlr_drivers::display::fill_rect(248, 8, 72, 24, 0x00601830);
+    text(260, 14, "Lock", 0x00FFFFFF, 0x00601830, 1);
     let clock = vlr_drivers::rtc::read();
     let stamp = alloc::format!("{:02}:{:02}:{:02}", clock.hour, clock.minute, clock.second);
     text(width.saturating_sub(360).max(220), 12, &stamp, 0x00FFE4EE, BAR, 2);
@@ -381,6 +417,89 @@ fn text(x: usize, y: usize, message: &str, fg: u32, bg: u32, scale: usize) {
         vlr_drivers::display::glyph(cursor, y, byte, fg, bg, scale);
         cursor += 8 * scale;
     }
+}
+
+fn route_keys() {
+    while let Some(byte) = vlr_drivers::input::pop() {
+        if byte == vlr_wm::CTRL_L {
+            lock_screen();
+            NEED_WINDOWS.store(true, Ordering::Relaxed);
+            paint_wallpaper_all();
+            continue;
+        }
+        if byte == vlr_wm::CTRL_N {
+            let _ = vlr_wm::cycle();
+            continue;
+        }
+        if vlr_wm::terminal_focused() {
+            vlr_wm::tty_push(byte);
+        } else {
+            let id = vlr_wm::focus_id();
+            vlr_wm::push_key(id, byte);
+        }
+    }
+}
+
+fn lock_screen() {
+    vlr_drivers::serial::write_str("locked\n");
+    loop {
+        let password = ask("Locked", "password", true);
+        let check = CHECK.load(Ordering::Relaxed);
+        let ok = if check == 0 {
+            password.is_empty()
+        } else {
+            let check: fn(&str) -> bool = unsafe { core::mem::transmute(check) };
+            check(&password)
+        };
+        if ok {
+            vlr_drivers::serial::write_str("unlocked\n");
+            return;
+        }
+        vlr_drivers::serial::write_str("wrong password\n");
+    }
+}
+
+fn draw_client(info: &vlr_wm::Info) {
+    let x = info.x.max(0) as usize;
+    let y = info.y.max(0) as usize;
+    let w = info.w.max(80) as usize;
+    let h = info.h.max(80) as usize;
+    let title_bg = if info.focused { TITLE } else { 0x00885 };
+    vlr_drivers::display::fill_rect(x, y, w, TITLE_H, title_bg);
+    vlr_drivers::display::fill_rect(x, y + TITLE_H, w, h - TITLE_H, CARD);
+    text(x + 8, y + 8, &info.title, 0x00FFFFFF, title_bg, 1);
+    vlr_drivers::display::fill_rect(x + w - 44, y + 6, 16, 16, 0x00FFE4EE);
+    text(x + w - 40, y + 8, "-", TITLE, 0x00FFE4EE, 1);
+    vlr_drivers::display::fill_rect(x + w - 24, y + 6, 16, 16, 0x00FFFFFF);
+    text(x + w - 20, y + 8, "x", TITLE, 0x00FFFFFF, 1);
+    text(x + 8, y + TITLE_H + 8, &info.text, INK, CARD, 1);
+    vlr_drivers::display::fill_rect(x + w - 14, y + h - 14, 12, 12, TITLE);
+}
+
+fn hit_clients(x: i32, y: i32) -> bool {
+    let list = vlr_wm::snapshot();
+    for info in list.iter().rev() {
+        if info.minimized || x < info.x || y < info.y || x >= info.x + info.w || y >= info.y + info.h {
+            continue;
+        }
+        if x >= info.x + info.w - 26 && y < info.y + TITLE_H as i32 {
+            vlr_wm::close(info.id);
+            wallpaper_rect(info.x, info.y, info.w, info.h);
+            return true;
+        }
+        if x >= info.x + info.w - 48 && y < info.y + TITLE_H as i32 {
+            vlr_wm::minimize(info.id);
+            wallpaper_rect(info.x, info.y, info.w, info.h);
+            return true;
+        }
+        if x >= info.x + info.w - 16 && y >= info.y + info.h - 16 {
+            vlr_wm::set_size(info.id, x - info.x, y - info.y);
+            return true;
+        }
+        vlr_wm::focus(info.id);
+        return true;
+    }
+    false
 }
 
 fn user_name() -> String {

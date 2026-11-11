@@ -412,7 +412,7 @@ use spin::Mutex;
 static VOLUME: Mutex<Option<Volume>> = Mutex::new(None);
 
 fn disk<R>(f: impl FnOnce(&mut dyn BlockDevice) -> Result<R, BtrfsError>) -> Result<R, BtrfsError> {
-    match vlr_drivers::ata::with_disk(|disk| f(disk)) {
+    match vlr_drivers::with_root_disk(|disk| f(disk)) {
         Ok(inner) => inner,
         Err(_) => Err(BtrfsError::Io),
     }
@@ -508,7 +508,7 @@ pub fn session_name() -> alloc::string::String {
 }
 
 pub fn system_mkdir(path: &str) -> Result<(), BtrfsError> {
-    if !(path.starts_with("/System") || path.starts_with("/Users")) {
+    if !privileged_path(path) {
         return Err(BtrfsError::ReadOnly);
     }
     mutate(|tx, _, _| {
@@ -520,8 +520,29 @@ pub fn system_mkdir(path: &str) -> Result<(), BtrfsError> {
     })
 }
 
+fn privileged_path(path: &str) -> bool {
+    path.starts_with("/System")
+        || path.starts_with("/Users")
+        || path.starts_with("/Apps")
+        || path.starts_with("/Libs")
+        || path.starts_with("/AppData")
+}
+
+pub fn system_remove(path: &str) -> Result<(), BtrfsError> {
+    if !privileged_path(path) {
+        return Err(BtrfsError::ReadOnly);
+    }
+    mutate(|tx, _, _| {
+        tx.elevate();
+        match tx.unlink(path) {
+            Err(BtrfsError::NotFound) => Ok(()),
+            other => other,
+        }
+    })
+}
+
 pub fn system_write(path: &str, data: &[u8]) -> Result<(), BtrfsError> {
-    if !(path.starts_with("/System/") || path.starts_with("/Users/")) {
+    if !privileged_path(path) {
         return Err(BtrfsError::ReadOnly);
     }
     mutate(|tx, vol, disk| {

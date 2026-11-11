@@ -27,7 +27,7 @@ pub extern "C" fn _start() -> ! {
     let info = ShellInfo {
         username: name,
         os_name: "Veriluvrionikrousdorn",
-        os_version: "1.0.0",
+        os_version: "1.1.0",
         usable_memory: 0,
         home_display: "~",
         home_path: home,
@@ -233,6 +233,21 @@ impl ShellIo for SysIo {
 
     fn rename_path(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
         code_result(rename(from, to))
+    }
+
+    fn install_app(&mut self, path: &str) -> Result<(), &'static str> {
+        match vlr_libc::install(path) {
+            0 => Ok(()),
+            -2 => Err("rejected"),
+            _ => Err("failed"),
+        }
+    }
+
+    fn uninstall_app(&mut self, name: &str) -> Result<(), &'static str> {
+        match vlr_libc::uninstall(name) {
+            0 => Ok(()),
+            _ => Err("failed"),
+        }
     }
 }
 

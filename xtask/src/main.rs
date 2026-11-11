@@ -36,6 +36,12 @@ fn run() -> Result<()> {
         .unwrap_or("run");
 
     match command {
+        "usb" => {
+            build_userspace()?;
+            make_filesystem()?;
+            build_kernel(false)?;
+            make_live()?;
+        }
         "build" => {
             build_userspace()?;
             make_filesystem()?;
@@ -57,6 +63,7 @@ fn run() -> Result<()> {
             persist_test()?;
             boot_test()?;
             shell_test()?;
+            live_test()?;
             println!("vlr tests passed");
         }
         other => bail!("unknown command '{other}'. expected build, run, or test"),
@@ -121,6 +128,61 @@ fn build_kernel(boot_test: bool) -> Result<()> {
             kernel_elf(boot_test).display()
         );
     }
+    Ok(())
+}
+
+fn make_live() -> Result<()> {
+    let elf = kernel_elf(false);
+    let bios = workspace_root().join("target/vlr-live.img");
+    let uefi = workspace_root().join("target/vlr-live-uefi.img");
+    let mut bios_builder = DiskImageBuilder::new(elf.clone());
+    bios_builder
+        .set_ramdisk(disk_path())
+        .create_bios_image(&bios)
+        .context("BIOS live image")?;
+    let mut uefi_builder = DiskImageBuilder::new(elf);
+    uefi_builder
+        .set_ramdisk(disk_path())
+        .create_uefi_image(&uefi)
+        .context("UEFI live image")?;
+    println!("live bios: {}", bios.display());
+    println!("live uefi: {}", uefi.display());
+    Ok(())
+}
+
+fn live_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
+    build_kernel(false)?;
+    make_live()?;
+    let log_path = workspace_root().join("target/live-test.log");
+    if log_path.exists() {
+        fs::remove_file(&log_path)?;
+    }
+    let status = Command::new("timeout")
+        .args(["--foreground", "90", "qemu-system-x86_64"])
+        .args(["-machine", "pc", "-accel", "tcg", "-cpu", "qemu64", "-m", "512M"])
+        .args(["-device", "qemu-xhci,id=xhci"])
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=stick,format=raw,file={}",
+            workspace_root().join("target/vlr-live.img").display()
+        ))
+        .args(["-device", "usb-storage,bus=xhci.0,drive=stick"])
+        .args(["-display", "none", "-no-reboot"])
+        .arg("-serial")
+        .arg(format!("file:{}", log_path.display()))
+        .status()
+        .context("live qemu")?;
+    let _ = status;
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    for needle in ["live-ok", "btrfs-ok", "gui-ok", "user@::vch#~ "] {
+        if !log.contains(needle) {
+            eprintln!("----- live serial -----\n{log}\n----- end -----");
+            bail!("live USB boot is missing '{needle}'");
+        }
+    }
+    println!("live usb test passed");
     Ok(())
 }
 
@@ -265,7 +327,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 1.0.0",
+        "VLR kernel 1.1.0",
         "btrfs-ok",
         "motd-ok",
         "apps-ok",
@@ -551,12 +613,61 @@ fn shell_session() -> Result<()> {
     if !wait_for(&captured, "vlr-motd", Duration::from_secs(5)) {
         bail!("cat output missing:\n{}", captured.lock().unwrap());
     }
+
+    writer
+        .write_all(b"install /Users/user/stage/widget.vlr\r")
+        .context("install")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "installed widget", Duration::from_secs(15)) {
+        bail!("install failed:\n{}", captured.lock().unwrap());
+    }
+    writer.write_all(b"uninstall widget\r").context("uninstall")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "removed widget", Duration::from_secs(15)) {
+        bail!("uninstall failed:\n{}", captured.lock().unwrap());
+    }
+    writer
+        .write_all(b"install /Apps/badfmt/badfmt.vlr\r")
+        .context("bad install")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "rejected", Duration::from_secs(10)) {
+        bail!("corrupt vlr was installed:\n{}", captured.lock().unwrap());
+    }
+
+    writer.write_all(b"run keys\r").context("run keys")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "keys-open", Duration::from_secs(15)) {
+        bail!("keys window missing:\n{}", captured.lock().unwrap());
+    }
+    writer.write_all(b"Z\r").context("key to window")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "keys:Z", Duration::from_secs(10)) {
+        bail!("focus did not route the key:\n{}", captured.lock().unwrap());
+    }
+    writer.write_all(&[0x0e]).context("cycle focus")?;
+    writer.flush().ok();
+    writer.write_all(b"echo back\r").context("echo after focus")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "back", Duration::from_secs(10)) {
+        bail!("focus did not return to vch:\n{}", captured.lock().unwrap());
+    }
+
+    writer.write_all(&[0x0c]).context("lock")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "password:", Duration::from_secs(10)) {
+        bail!("lock screen missing:\n{}", captured.lock().unwrap());
+    }
+    writer.write_all(b"\r").context("unlock")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "unlocked", Duration::from_secs(10)) {
+        bail!("empty password did not unlock:\n{}", captured.lock().unwrap());
+    }
     Ok(())
 }
 
 fn build_userspace() -> Result<()> {
     let target = workspace_root().join("target/user-build");
-    for package in ["hello", "greet", "vch-bin"] {
+    for package in ["hello", "greet", "vch-bin", "keys"] {
         let mut command = cargo();
         command.env("CARGO_TARGET_DIR", &target);
         command.args([
@@ -680,6 +791,13 @@ fn make_fs(seed_account: bool) -> Result<()> {
     pack(&bins.join("hello"), &root.join("Apps/hello/hello.vlr"))?;
     pack(&bins.join("greet"), &root.join("Apps/greet/greet.vlr"))?;
     pack(&bins.join("vch-bin"), &root.join("Apps/vch/vch.vlr"))?;
+    fs::create_dir_all(root.join("Apps/keys"))?;
+    pack(&bins.join("keys"), &root.join("Apps/keys/keys.vlr"))?;
+    fs::create_dir_all(root.join("Users/user/stage"))?;
+    fs::copy(
+        root.join("Apps/hello/hello.vlr"),
+        root.join("Users/user/stage/widget.vlr"),
+    )?;
     fs::write(root.join("Apps/badfmt/badfmt.vlr"), b"not-a-vlr")?;
     fs::write(root.join("Users/user/motd"), b"vlr-motd\n")?;
     fs::write(root.join("Libs/.keep"), b"")?;

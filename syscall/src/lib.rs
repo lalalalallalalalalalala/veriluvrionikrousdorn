@@ -14,8 +14,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use vlr_arch::syscall_entry::SyscallFrame;
 use vlr_libc::{
     FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_GETPID, SYS_GETTICKS, SYS_KILL,
-    SYS_FSYNC, SYS_GETUSER, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_READDIR,
-    SYS_RENAME,
+    SYS_FSYNC, SYS_GETUSER, SYS_INSTALL, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ,
+    SYS_READDIR,
+    SYS_RENAME, SYS_UNINSTALL, SYS_WIN_CLOSE, SYS_WIN_OPEN, SYS_WIN_POLL, SYS_WIN_TEXT,
     SYS_SLEEP, SYS_TASKSTAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SYS_YIELD, O_APPEND, O_CREAT, O_RDWR,
     O_TRUNC, O_WRONLY, TaskRec, TwoPaths,
 };
@@ -90,6 +91,18 @@ fn dispatch(number: u64, a: u64, b: u64, c: u64) -> u64 {
         SYS_RENAME => sys_rename(a),
         SYS_FSYNC => 0,
         SYS_GETUSER => sys_getuser(a, b),
+        SYS_WIN_OPEN => sys_win_open(a, b, c),
+        SYS_WIN_CLOSE => {
+            if vlr_wm::close(a) {
+                0
+            } else {
+                FAULT
+            }
+        }
+        SYS_WIN_TEXT => sys_win_text(a, b, c),
+        SYS_WIN_POLL => sys_win_poll(a),
+        SYS_INSTALL => sys_install(a, b),
+        SYS_UNINSTALL => sys_uninstall(a, b),
         _ => FAULT,
     }
 }
@@ -135,6 +148,9 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
 fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
     if fd != FD_STDIN {
         return sys_read_file(fd, ptr, len);
+    }
+    if vlr_wm::active() {
+        return sys_read_tty(ptr, len);
     }
     let len = len.min(4096) as usize;
     if len == 0 {
@@ -236,6 +252,133 @@ fn sys_write_file(fd: u64, ptr: u64, len: u64) -> u64 {
         vlr_sched::fd_advance(fd, meta.pos + len as u64);
     }
     len as u64
+}
+
+fn sys_read_tty(ptr: u64, len: u64) -> u64 {
+    let len = len.min(4096) as usize;
+    if len == 0 {
+        return 0;
+    }
+    if !vlr_memory::is_user_range(ptr, len) {
+        return FAULT;
+    }
+    let mut done = 0usize;
+    while done < len {
+        if let Some(byte) = vlr_wm::tty_pop() {
+            unsafe {
+                ((ptr + done as u64) as *mut u8).write(byte);
+            }
+            done += 1;
+            if byte == b'\n' {
+                break;
+            }
+        } else if done > 0 {
+            break;
+        } else {
+            vlr_sched::sleep(1);
+        }
+    }
+    done as u64
+}
+
+fn sys_win_open(ptr: u64, len: u64, packed: u64) -> u64 {
+    let Some(title) = user_string(ptr, len) else {
+        return FAULT;
+    };
+    let w = (packed & 0xffff) as i32;
+    let h = ((packed >> 16) & 0xffff) as i32;
+    vlr_wm::create(&title, w.max(160), h.max(120)).unwrap_or(FAULT)
+}
+
+fn sys_win_text(id: u64, ptr: u64, len: u64) -> u64 {
+    let Some(text) = user_string(ptr, len) else {
+        return FAULT;
+    };
+    vlr_wm::append_text(id, &text);
+    text.len() as u64
+}
+
+fn sys_win_poll(id: u64) -> u64 {
+    match vlr_wm::poll(id) {
+        Some(byte) => byte as u64,
+        None => FAULT,
+    }
+}
+
+pub fn install_file(path: &str) -> Result<(), &'static str> {
+    let bytes = vlr_btrfs::read_path(path).map_err(|_| "not found")?;
+    let (header, _) = vlr_loader::parse(&bytes).map_err(|_| "rejected")?;
+    let name = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .strip_suffix(".vlr")
+        .unwrap_or("app");
+    if name.is_empty() || name.contains('.') {
+        return Err("rejected");
+    }
+    if header.kind == vlr_loader::KIND_LIBRARY {
+        vlr_btrfs::system_mkdir("/Libs").map_err(|_| "failed")?;
+        let dest = alloc::format!("/Libs/{name}.vlr");
+        vlr_btrfs::system_write(&dest, &bytes).map_err(|_| "failed")?;
+        return Ok(());
+    }
+    if header.kind != vlr_loader::KIND_EXECUTABLE {
+        return Err("rejected");
+    }
+    let dir = alloc::format!("/Apps/{name}");
+    let dest = alloc::format!("{dir}/{name}.vlr");
+    vlr_btrfs::system_mkdir(&dir).map_err(|_| "failed")?;
+    vlr_btrfs::system_write(&dest, &bytes).map_err(|_| "failed")?;
+    let data = alloc::format!("/AppData/{name}");
+    let _ = vlr_btrfs::system_mkdir(&data);
+    let _ = vlr_btrfs::system_mkdir(&alloc::format!("{data}/config"));
+    let _ = vlr_btrfs::system_mkdir(&alloc::format!("{data}/data"));
+    let _ = vlr_btrfs::system_mkdir(&alloc::format!("{data}/cache"));
+    let hook = INSTALL_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        let hook: fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
+    Ok(())
+}
+
+pub fn uninstall_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.contains('/') || name.contains('.') {
+        return Err("rejected");
+    }
+    let file = alloc::format!("/Apps/{name}/{name}.vlr");
+    vlr_btrfs::system_remove(&file).map_err(|_| "failed")?;
+    let _ = vlr_btrfs::system_remove(&alloc::format!("/Apps/{name}"));
+    let _ = vlr_btrfs::system_remove(&alloc::format!("/Libs/{name}.vlr"));
+    Ok(())
+}
+
+static INSTALL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_install_hook(hook: fn()) {
+    INSTALL_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+fn sys_install(ptr: u64, len: u64) -> u64 {
+    let Some(path) = user_string(ptr, len) else {
+        return FAULT;
+    };
+    match install_file(&path) {
+        Ok(()) => 0,
+        Err("rejected") => (-2i64) as u64,
+        Err(_) => FAULT,
+    }
+}
+
+fn sys_uninstall(ptr: u64, len: u64) -> u64 {
+    let Some(name) = user_string(ptr, len) else {
+        return FAULT;
+    };
+    match uninstall_name(&name) {
+        Ok(()) => 0,
+        Err(_) => FAULT,
+    }
 }
 
 fn sys_getuser(ptr: u64, len: u64) -> u64 {

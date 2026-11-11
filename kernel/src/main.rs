@@ -98,7 +98,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "shell")]
     vlr_syscall::set_demo_spawner(spawn_named);
     vlr_loader::init();
-    mount_disk();
+    mount_disk(boot_info);
     vlr_drivers::serial::write_str("diag: devices armed\n");
 
     USABLE_MEMORY.store(memory.usable_bytes(), core::sync::atomic::Ordering::Relaxed);
@@ -339,7 +339,20 @@ fn user_checks() {
     vlr_console::println!("user-bad-ok");
 }
 
-fn mount_disk() {
+fn mount_disk(boot_info: &'static mut BootInfo) {
+    if let Some(addr) = boot_info.ramdisk_addr.into_option() {
+        if boot_info.ramdisk_len >= 4096 {
+            vlr_drivers::ramdisk::init(addr as *mut u8, boot_info.ramdisk_len as usize);
+            vlr_drivers::serial::write_str("live-ok\n");
+        }
+    }
+    if vlr_drivers::ramdisk::active() {
+        match vlr_vfs::mount() {
+            Ok(()) => vlr_console::println!("btrfs-ok"),
+            Err(_) => vlr_console::println!("btrfs-failed"),
+        }
+        return;
+    }
     match vlr_drivers::ata::init() {
         Ok(()) => match vlr_vfs::mount() {
             Ok(()) => vlr_console::println!("btrfs-ok"),
@@ -416,6 +429,8 @@ fn log_exception(message: &str) {
 #[cfg(all(feature = "shell", not(feature = "boot-test")))]
 fn bring_up_desktop() {
     let name = session::establish();
+    vlr_gui::set_checker(session::check_password);
+    vlr_syscall::set_install_hook(vlr_gui::refresh_apps);
     vlr_drivers::mouse::init();
     if vlr_drivers::display::is_ready() {
         vlr_gui::set_user(&name);
@@ -594,6 +609,14 @@ impl vch::ShellIo for KernelShell {
 
     fn rename_path(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
         vlr_vfs::rename_path(from, to).map_err(vfs_err)
+    }
+
+    fn install_app(&mut self, path: &str) -> Result<(), &'static str> {
+        vlr_syscall::install_file(path)
+    }
+
+    fn uninstall_app(&mut self, name: &str) -> Result<(), &'static str> {
+        vlr_syscall::uninstall_name(name)
     }
 
     fn exec(&mut self, path: &str) -> Result<u64, &'static str> {

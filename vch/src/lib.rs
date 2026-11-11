@@ -70,6 +70,14 @@ pub trait ShellIo {
         let _ = (from, to);
         Err("read only")
     }
+    fn install_app(&mut self, path: &str) -> Result<(), &'static str> {
+        let _ = path;
+        Err("failed")
+    }
+    fn uninstall_app(&mut self, name: &str) -> Result<(), &'static str> {
+        let _ = name;
+        Err("failed")
+    }
 }
 
 pub struct ShellInfo {
@@ -233,6 +241,8 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  rm       remove a file or empty directory\n  \
                  mv       rename a file or directory\n  \
                  write    write text into a file\n  \
+                 install  copy a .vlr into /Apps\n  \
+                 uninstall remove an app from /Apps\n  \
                  run      run a .vlr by name or path\n",
             );
         }
@@ -383,6 +393,32 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                 report(io, result);
             }
         }
+        "install" => {
+            let path = io_path(io, info, rest);
+            let stem = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(path.as_str())
+                .strip_suffix(".vlr")
+                .unwrap_or("app");
+            let stem = alloc::string::String::from(stem);
+            match io.install_app(&path) {
+                Ok(()) => {
+                    io.write_str("installed ");
+                    io.write_str(&stem);
+                    io.write_str("\n");
+                }
+                Err(err) => report(io, Err(err)),
+            }
+        }
+        "uninstall" => match io.uninstall_app(rest) {
+            Ok(()) => {
+                io.write_str("removed ");
+                io.write_str(rest);
+                io.write_str("\n");
+            }
+            Err(err) => report(io, Err(err)),
+        },
         "write" => {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let path = parts.next().unwrap_or("");

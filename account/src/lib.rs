@@ -9,6 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub const ACCOUNT_PATH: &str = "/System/account";
+pub const PBKDF2_ITERS: u32 = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -26,22 +27,45 @@ impl Account {
         if !self.password_required() {
             return password.is_empty();
         }
-        self.hash == hex(&digest(&decode_hex(&self.salt), password.as_bytes()))
+        let salt = decode_hex(&self.salt);
+        if let Some(rest) = self.hash.strip_prefix("pbkdf2:") {
+            let mut parts = rest.split(':');
+            let iters: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            let want = parts.next().unwrap_or("");
+            return iters > 0 && want == hex(&pbkdf2(password.as_bytes(), &salt, iters));
+        }
+        self.hash == hex(&digest(&salt, password.as_bytes()))
+    }
+
+    pub fn needs_upgrade(&self) -> bool {
+        self.password_required() && !self.hash.starts_with("pbkdf2:")
     }
 }
 
 pub fn seal(name: &str, password: &str, salt: [u8; 8]) -> Account {
-    let salt_hex = hex(&salt);
     let hash = if password.is_empty() {
         String::from("-")
     } else {
-        hex(&digest(&salt, password.as_bytes()))
+        alloc::format!(
+            "pbkdf2:{}:{}",
+            PBKDF2_ITERS,
+            hex(&pbkdf2(password.as_bytes(), &salt, PBKDF2_ITERS))
+        )
     };
     Account {
         name: String::from(name),
-        salt: salt_hex,
+        salt: hex(&salt),
         hash,
     }
+}
+
+pub fn upgrade(account: &Account, password: &str) -> Account {
+    let salt = decode_hex(&account.salt);
+    let mut salt_bytes = [0u8; 8];
+    for (i, byte) in salt.iter().take(8).enumerate() {
+        salt_bytes[i] = *byte;
+    }
+    seal(&account.name, password, salt_bytes)
 }
 
 pub fn encode(account: &Account) -> String {
@@ -83,6 +107,44 @@ pub fn valid_name(name: &str) -> bool {
 
 pub fn home_of(name: &str) -> String {
     alloc::format!("/Users/{name}")
+}
+
+fn pbkdf2(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
+    let mut block = Vec::with_capacity(salt.len() + 4);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &block);
+    let mut t = u;
+    for _ in 1..iters.max(1) {
+        u = hmac_sha256(password, &u);
+        for i in 0..32 {
+            t[i] ^= u[i];
+        }
+    }
+    t
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(message);
+    let inner_hash = sha256(&inner);
+    let mut outer = Vec::with_capacity(96);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
 }
 
 fn digest(salt: &[u8], password: &[u8]) -> [u8; 32] {
@@ -239,5 +301,22 @@ mod tests {
         assert!(!account.verify("pitaya "));
         assert!(parse(&encode(&account)).unwrap().verify("pitaya"));
         assert!(parse("name=bad name").is_none());
+    }
+
+    #[test]
+    fn legacy_sha256_still_verifies_and_upgrades() {
+        let salt = [9u8, 8, 7, 6, 5, 4, 3, 2];
+        let legacy = Account {
+            name: String::from("nia"),
+            salt: hex(&salt),
+            hash: hex(&digest(&salt, b"pitaya")),
+        };
+        assert!(legacy.needs_upgrade());
+        assert!(legacy.verify("pitaya"));
+        let next = upgrade(&legacy, "pitaya");
+        assert!(!next.needs_upgrade());
+        assert!(next.hash.starts_with("pbkdf2:"));
+        assert!(next.verify("pitaya"));
+        assert!(!next.verify("nope"));
     }
 }

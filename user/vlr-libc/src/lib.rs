@@ -27,6 +27,12 @@ pub const SYS_UNLINK: u64 = 18;
 pub const SYS_RENAME: u64 = 19;
 pub const SYS_FSYNC: u64 = 20;
 pub const SYS_GETUSER: u64 = 21;
+pub const SYS_WIN_OPEN: u64 = 22;
+pub const SYS_WIN_CLOSE: u64 = 23;
+pub const SYS_WIN_TEXT: u64 = 24;
+pub const SYS_WIN_POLL: u64 = 25;
+pub const SYS_INSTALL: u64 = 26;
+pub const SYS_UNINSTALL: u64 = 27;
 
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
@@ -155,6 +161,27 @@ pub fn getuser(buf: &mut [u8]) -> i64 {
     syscall3(SYS_GETUSER, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
 }
 
+pub fn win_open(title: &str, width: u64, height: u64) -> i64 {
+    syscall3(
+        SYS_WIN_OPEN,
+        title.as_ptr() as u64,
+        title.len() as u64,
+        width | (height << 16),
+    ) as i64
+}
+
+pub fn win_poll(id: u64) -> i64 {
+    syscall1(SYS_WIN_POLL, id) as i64
+}
+
+pub fn install(path: &str) -> i64 {
+    syscall3(SYS_INSTALL, path.as_ptr() as u64, path.len() as u64, 0) as i64
+}
+
+pub fn uninstall(name: &str) -> i64 {
+    syscall3(SYS_UNINSTALL, name.as_ptr() as u64, name.len() as u64, 0) as i64
+}
+
 pub fn close(fd: u64) -> i64 {
     syscall1(SYS_CLOSE, fd) as i64
 }
@@ -265,6 +292,12 @@ mod tests {
             SYS_RENAME,
             SYS_FSYNC,
             SYS_GETUSER,
+            SYS_WIN_OPEN,
+            SYS_WIN_CLOSE,
+            SYS_WIN_TEXT,
+            SYS_WIN_POLL,
+            SYS_INSTALL,
+            SYS_UNINSTALL,
         ];
         for (index, number) in nums.iter().enumerate() {
             assert_eq!(*number, (index as u64) + 1);

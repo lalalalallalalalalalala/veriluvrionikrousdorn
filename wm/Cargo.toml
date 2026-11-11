@@ -1,0 +1,13 @@
+[package]
+name = "vlr-wm"
+version = "1.1.0"
+edition = "2021"
+publish = false
+description = "Window focus, z-order, and per-window input"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

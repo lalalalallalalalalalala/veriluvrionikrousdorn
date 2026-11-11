@@ -5,6 +5,21 @@ use alloc::string::String;
 use vlr_account::{home_of, parse, seal, Account, ACCOUNT_PATH};
 use vlr_drivers::{display, input, serial};
 
+pub fn check_password(password: &str) -> bool {
+    let Some(account) = load() else {
+        return password.is_empty();
+    };
+    if !account.verify(password) {
+        return false;
+    }
+    if account.needs_upgrade() {
+        let next = vlr_account::upgrade(&account, password);
+        let encoded = vlr_account::encode(&next);
+        let _ = vlr_btrfs::system_write(vlr_account::ACCOUNT_PATH, encoded.as_bytes());
+    }
+    true
+}
+
 pub fn establish() -> String {
     if let Some(account) = load() {
         if account.password_required() {
@@ -12,6 +27,11 @@ pub fn establish() -> String {
             loop {
                 let password = prompt(&title, "password", true);
                 if account.verify(&password) {
+                    if account.needs_upgrade() {
+                        let next = vlr_account::upgrade(&account, &password);
+                        let encoded = vlr_account::encode(&next);
+                        let _ = vlr_btrfs::system_write(vlr_account::ACCOUNT_PATH, encoded.as_bytes());
+                    }
                     break;
                 }
                 serial::write_str("wrong password\n");

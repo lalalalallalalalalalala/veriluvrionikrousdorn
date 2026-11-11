@@ -18,3 +18,4 @@ vlr-libc = { path = "../user/vlr-libc" }
 vlr-loader = { path = "../loader" }
 vlr-memory = { path = "../memory" }
 vlr-sched = { path = "../sched" }
+vlr-wm = { path = "../wm" }

@@ -15,4 +15,5 @@ vlr-console = { path = "../console" }
 vlr-drivers = { path = "../drivers" }
 vlr-loader = { path = "../loader" }
 vlr-vfs = { path = "../vfs" }
+vlr-wm = { path = "../wm" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
