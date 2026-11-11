@@ -25,6 +25,14 @@ pub struct MemorySnapshot {
     pub heap_free: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub id: u64,
+    pub name: String,
+    pub state: &'static str,
+    pub ticks: u64,
+}
+
 pub trait ShellIo {
     fn write_str(&mut self, text: &str);
     fn clear(&mut self);
@@ -32,6 +40,9 @@ pub trait ShellIo {
     fn read_byte(&mut self) -> u8;
     fn ticks(&mut self) -> u64;
     fn memory(&mut self) -> MemorySnapshot;
+    fn tasks(&mut self) -> Vec<TaskSnapshot>;
+    fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str>;
+    fn kill_task(&mut self, id: u64) -> Result<(), &'static str>;
 }
 
 pub struct ShellInfo {
@@ -137,7 +148,10 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  uname    system name\n  \
                  ticks    hardware timer ticks\n  \
                  mem      frame and heap usage\n  \
-                 history  recent commands\n",
+                 history  recent commands\n  \
+                 ps       list tasks\n  \
+                 spawn    spawn ticker or spinner\n  \
+                 kill     stop a task by id\n",
             );
         }
         "clear" => io.clear(),
@@ -174,6 +188,30 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
             io.write_str(text);
         }
         "mem" => write_mem(io),
+        "ps" => write_ps(io),
+        "spawn" => match io.spawn_task(rest) {
+            Ok(id) => {
+                let line = alloc::format!("spawned {id}\n");
+                io.write_str(&line);
+            }
+            Err(err) => {
+                io.write_str(err);
+                io.write_str("\n");
+            }
+        },
+        "kill" => match parse_u64(rest) {
+            Some(id) => match io.kill_task(id) {
+                Ok(()) => {
+                    let line = alloc::format!("killed {id}\n");
+                    io.write_str(&line);
+                }
+                Err(err) => {
+                    io.write_str(err);
+                    io.write_str("\n");
+                }
+            },
+            None => io.write_str("kill failed\n"),
+        },
         "history" => {
             for (index, command) in history.iter().enumerate() {
                 let line = alloc::format!("{index} {command}\n");
@@ -215,7 +253,7 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
     io.write_str(info.os_name);
     io.write_str(" (VLR) ");
     io.write_str(info.os_version);
-    io.write_str("\nx86-64 kernel, memory milestone\nuser: ");
+    io.write_str("\nx86-64 kernel, multitasking milestone\nuser: ");
     io.write_str(info.username);
     io.write_str("\nhome: ");
     io.write_str(info.home_path);
@@ -249,6 +287,30 @@ fn write_about<I: ShellIo>(io: &mut I, info: &ShellInfo) {
     };
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
     io.write_str(text);
+}
+
+fn write_ps<I: ShellIo>(io: &mut I) {
+    io.write_str("id name state ticks\n");
+    for task in io.tasks() {
+        let line = alloc::format!("{} {} {} {}\n", task.id, task.name, task.state, task.ticks);
+        io.write_str(&line);
+    }
+}
+
+fn parse_u64(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u64);
+    }
+    Some(value)
 }
 
 fn write_mem<I: ShellIo>(io: &mut I) {
@@ -303,6 +365,36 @@ mod tests {
                 heap_total: 4096,
                 heap_used: 128,
                 heap_free: 3968,
+            }
+        }
+        fn tasks(&mut self) -> Vec<TaskSnapshot> {
+            alloc::vec![
+                TaskSnapshot {
+                    id: 0,
+                    name: String::from("idle"),
+                    state: "running",
+                    ticks: 1,
+                },
+                TaskSnapshot {
+                    id: 1,
+                    name: String::from("vch"),
+                    state: "ready",
+                    ticks: 4,
+                },
+            ]
+        }
+        fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str> {
+            if name == "ticker" {
+                Ok(5)
+            } else {
+                Err("unknown task")
+            }
+        }
+        fn kill_task(&mut self, id: u64) -> Result<(), &'static str> {
+            if id == 0 {
+                Err("kill failed")
+            } else {
+                Ok(())
             }
         }
     }
@@ -376,6 +468,29 @@ mod tests {
         let history = alloc::vec![String::from("echo hello"), String::from("history")];
         dispatch(&mut io, &info, "history", &history);
         assert_eq!(io.out, "0 echo hello\n1 history\n");
+
+        io.out.clear();
+        io.out.clear();
+        dispatch(&mut io, &info, "ps", &[]);
+        assert!(io.out.contains("id name state ticks"));
+        assert!(io.out.contains("idle"));
+        assert!(io.out.contains("vch"));
+
+        io.out.clear();
+        dispatch(&mut io, &info, "spawn ticker", &[]);
+        assert_eq!(io.out, "spawned 5\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "spawn nope", &[]);
+        assert_eq!(io.out, "unknown task\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "kill 5", &[]);
+        assert_eq!(io.out, "killed 5\n");
+
+        io.out.clear();
+        dispatch(&mut io, &info, "kill", &[]);
+        assert_eq!(io.out, "kill failed\n");
 
         io.out.clear();
         dispatch(&mut io, &info, "nope", &[]);

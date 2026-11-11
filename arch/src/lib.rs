@@ -37,6 +37,14 @@ pub fn register_irq(irq: u8, handler: fn()) {
     IRQ_HANDLERS[irq as usize].store(handler as usize, Ordering::Release);
 }
 
+static PREEMPT: AtomicUsize = AtomicUsize::new(0);
+
+/// Вызывается после EOI таймера, уже с закрытыми прерываниями.
+/// Планировщик переключает задачу здесь, чтобы следующий тик не ждал iret.
+pub fn set_preempt_hook(hook: fn()) {
+    PREEMPT.store(hook as usize, Ordering::Release);
+}
+
 pub(crate) fn dispatch_irq(irq: u8) {
     let ptr = IRQ_HANDLERS[irq as usize].load(Ordering::Acquire);
     if ptr != 0 {
@@ -44,6 +52,13 @@ pub(crate) fn dispatch_irq(irq: u8) {
         handler();
     }
     pic::eoi(irq);
+    if irq == 0 {
+        let hook = PREEMPT.load(Ordering::Acquire);
+        if hook != 0 {
+            let hook: fn() = unsafe { core::mem::transmute(hook) };
+            hook();
+        }
+    }
 }
 
 /// Разрешить доставку указанной линии IRQ.

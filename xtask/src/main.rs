@@ -222,7 +222,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 0.2.0",
+        "VLR kernel 0.3.0",
         "timer-ok",
         "offset-map-ok",
         "heap-large-ok",
@@ -230,6 +230,9 @@ fn boot_test() -> Result<()> {
         "heap-ok",
         "page-map-ok",
         "page-identity-ok",
+        "sched-ok",
+        "sleep-ok",
+        "reap-ok",
         "exception: page fault at 0xffff820000000000",
         "page-fault-ok addr=0xffff820000000000",
         "vlr-boot-ok",
@@ -327,6 +330,14 @@ fn shell_session() -> Result<()> {
         || !wait_for(&captured, "heap: total", Duration::from_secs(5))
     {
         bail!("mem output missing:\n{}", captured.lock().unwrap());
+    }
+
+    writer.write_all(b"ps\r").context("write ps")?;
+    writer.flush().ok();
+    if !wait_for(&captured, "ticker", Duration::from_secs(5))
+        || !wait_for(&captured, "spinner", Duration::from_secs(5))
+    {
+        bail!("ps output missing:\n{}", captured.lock().unwrap());
     }
 
     writer.write_all(b"bogus\r").context("write bogus")?;

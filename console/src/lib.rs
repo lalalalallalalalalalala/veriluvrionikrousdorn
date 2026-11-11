@@ -10,8 +10,11 @@ use core::fmt;
 use vlr_drivers::{display, serial};
 
 pub fn write_str(text: &str) {
-    display::write_str(text);
-    serial::write_str(text);
+    // Один процессор: пока пишем, тик не должен увести нас с занятой консолью.
+    vlr_arch::without_interrupts(|| {
+        display::write_str(text);
+        serial::write_str(text);
+    });
 }
 
 pub fn clear() {

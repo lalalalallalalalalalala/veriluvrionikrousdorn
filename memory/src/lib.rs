@@ -138,7 +138,10 @@ pub fn map_identity(phys: u64) -> Result<(), MapError> {
 }
 
 pub fn unmap_4k(virt: u64) -> Result<u64, MapError> {
-    paging::unmap_4k(virt)
+    let phys = paging::unmap_4k(virt)?;
+    // Кадр данных возвращается в пул. Кадры самих таблиц страниц остаются.
+    let _ = free_frame(phys);
+    Ok(phys)
 }
 
 pub fn stats() -> MemoryStats {

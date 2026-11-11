@@ -1,12 +1,14 @@
 [package]
 name = "vlr-sched"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
-description = "Future task scheduler"
+description = "Preemptive round-robin kernel threads"
 
 [lib]
 test = false
 bench = false
 
 [dependencies]
+vlr-arch = { path = "../arch" }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

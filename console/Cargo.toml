@@ -10,4 +10,5 @@ test = false
 bench = false
 
 [dependencies]
+vlr-arch = { path = "../arch" }
 vlr-drivers = { path = "../drivers" }

@@ -15,6 +15,8 @@ use vlr_memory::RegionRecord;
 const OS_NAME: &str = "Veriluvrionikrousdorn";
 const OS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+static USABLE_MEMORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 128 * 1024;
@@ -82,35 +84,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     vlr_drivers::serial::write_str("diag: heap ok\n");
 
+    vlr_sched::init();
     vlr_drivers::timer::init();
     vlr_drivers::keyboard::init();
     vlr_drivers::serial::enable_rx_irq();
-    let _scheduler = vlr_sched::init();
     vlr_syscall::init();
     let _vfs = vlr_vfs::init();
     vlr_btrfs::init();
     vlr_loader::init();
     vlr_drivers::serial::write_str("diag: devices armed\n");
 
+    USABLE_MEMORY.store(memory.usable_bytes(), core::sync::atomic::Ordering::Relaxed);
     print_banner(memory.usable_bytes());
+
+    #[cfg(feature = "shell")]
+    {
+        let _ = vlr_sched::spawn("vch", vch_task);
+        let _ = vlr_sched::spawn("ticker", ticker_task);
+        let _ = vlr_sched::spawn("spinner", spinner_task);
+    }
+
     vlr_arch::enable_interrupts();
 
     #[cfg(feature = "boot-test")]
     boot_test();
 
     #[cfg(feature = "shell")]
-    {
-        let info = vch::ShellInfo {
-            username: vlr_loader::PLACEHOLDER_USER,
-            os_name: OS_NAME,
-            os_version: OS_VERSION,
-            usable_memory: memory.usable_bytes(),
-            home_display: vlr_loader::HOME_DISPLAY,
-            home_path: vlr_loader::HOME_PATH,
-        };
-        let mut shell = KernelShell;
-        vch::run(&mut shell, &info);
-    }
+    vlr_sched::idle();
 }
 
 fn print_banner(usable_bytes: u64) {
@@ -118,7 +118,7 @@ fn print_banner(usable_bytes: u64) {
     vlr_console::println!("{OS_NAME}");
     vlr_console::set_color(0x00E7E2D6);
     vlr_console::println!("VLR kernel {OS_VERSION}");
-    vlr_console::println!("x86-64 foundation");
+    vlr_console::println!("x86-64 multitasking");
     let mib = usable_bytes / (1024 * 1024);
     vlr_console::println!("usable memory: {mib} MiB");
     vlr_console::println!();
@@ -150,6 +150,7 @@ fn boot_test() -> ! {
 
     heap_checks();
     paging_checks();
+    sched_checks();
 
     const FAULT_ADDR: u64 = 0xFFFF_8200_0000_0000;
     vlr_arch::set_page_fault_hook(on_test_fault);
@@ -209,8 +210,8 @@ fn paging_checks() {
     }
     let saw = unsafe { core::ptr::read_volatile(virt as *const u64) };
     let unmapped = vlr_memory::unmap_4k(virt).ok();
-    if vlr_memory::free_frame(frame).is_err() {
-        fail("free-frame-bad");
+    if vlr_memory::free_frame(frame).is_ok() {
+        fail("double-free");
     }
     if saw != 0x1122_3344_5566_7788 || unmapped != Some(frame) {
         fail("page-map-bad");
@@ -231,13 +232,79 @@ fn paging_checks() {
     let via_offset = vlr_memory::phys_to_virt(identity).unwrap_or_else(|| fail("no-offset"));
     let saw = unsafe { core::ptr::read_volatile(via_offset as *const u64) };
     let unmapped = vlr_memory::unmap_4k(identity).ok();
-    if vlr_memory::free_frame(identity).is_err() {
-        fail("identity-free-bad");
+    if vlr_memory::free_frame(identity).is_ok() {
+        fail("identity-double-free");
     }
     if saw != 0x00C0_FFEE || unmapped != Some(identity) {
         fail("page-identity-bad");
     }
     vlr_console::println!("page-identity-ok");
+}
+
+#[cfg(feature = "boot-test")]
+static ALPHA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "boot-test")]
+static BETA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "boot-test")]
+static SLEEPER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "boot-test")]
+fn alpha_worker() {
+    loop {
+        ALPHA.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "boot-test")]
+fn beta_worker() {
+    loop {
+        BETA.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "boot-test")]
+fn sleeper_worker() {
+    vlr_sched::sleep(20);
+    SLEEPER_DONE.store(true, core::sync::atomic::Ordering::Release);
+    vlr_sched::exit();
+}
+
+#[cfg(feature = "boot-test")]
+fn quitter_worker() {
+    vlr_sched::exit();
+}
+
+#[cfg(feature = "boot-test")]
+fn sched_checks() {
+    if vlr_sched::spawn("alpha", alpha_worker).is_err()
+        || vlr_sched::spawn("beta", beta_worker).is_err()
+        || vlr_sched::spawn("sleeper", sleeper_worker).is_err()
+        || vlr_sched::spawn("quitter", quitter_worker).is_err()
+    {
+        fail("spawn-bad");
+    }
+    let start = vlr_drivers::timer::ticks();
+    loop {
+        let alpha = ALPHA.load(core::sync::atomic::Ordering::Relaxed);
+        let beta = BETA.load(core::sync::atomic::Ordering::Relaxed);
+        let slept = SLEEPER_DONE.load(core::sync::atomic::Ordering::Acquire);
+        let reaped = !vlr_sched::exists("quitter");
+        if alpha > 0 && beta > 0 && slept && reaped {
+            vlr_console::println!("sched-ok alpha={alpha} beta={beta}");
+            vlr_console::println!("sleep-ok");
+            vlr_console::println!("reap-ok");
+            break;
+        }
+        if vlr_drivers::timer::ticks().saturating_sub(start) > 500 {
+            vlr_console::println!(
+                "sched-bad alpha={alpha} beta={beta} slept={slept} reaped={reaped}"
+            );
+            fail("sched-timeout");
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(feature = "boot-test")]
@@ -256,6 +323,46 @@ fn fail(message: &str) -> ! {
 fn log_exception(message: &str) {
     vlr_drivers::serial::write_str(message);
     let _ = vlr_drivers::display::try_write_str(message);
+}
+
+#[cfg(feature = "shell")]
+fn vch_task() {
+    let info = vch::ShellInfo {
+        username: vlr_loader::PLACEHOLDER_USER,
+        os_name: OS_NAME,
+        os_version: OS_VERSION,
+        usable_memory: USABLE_MEMORY.load(core::sync::atomic::Ordering::Relaxed),
+        home_display: vlr_loader::HOME_DISPLAY,
+        home_path: vlr_loader::HOME_PATH,
+    };
+    let mut shell = KernelShell;
+    vch::run(&mut shell, &info);
+}
+
+#[cfg(feature = "shell")]
+fn ticker_task() {
+    loop {
+        vlr_sched::sleep(50);
+    }
+}
+
+#[cfg(feature = "shell")]
+fn spinner_task() {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "shell")]
+fn spawn_named(name: &str) -> Result<u64, &'static str> {
+    let entry = match name {
+        "ticker" => ticker_task,
+        "spinner" => spinner_task,
+        _ => return Err("unknown task"),
+    };
+    vlr_sched::spawn(name, entry)
+        .map(|id| id.0)
+        .map_err(|_| "spawn failed")
 }
 
 #[cfg(feature = "shell")]
@@ -293,6 +400,30 @@ impl vch::ShellIo for KernelShell {
             heap_used: stats.heap_used as u64,
             heap_free: stats.heap_free as u64,
         }
+    }
+
+    fn tasks(&mut self) -> alloc::vec::Vec<vch::TaskSnapshot> {
+        let mut raw = [vlr_sched::TaskInfo::empty(); vlr_sched::MAX_TASKS];
+        let count = vlr_sched::snapshot(&mut raw);
+        raw[..count]
+            .iter()
+            .map(|task| vch::TaskSnapshot {
+                id: task.id,
+                name: core::str::from_utf8(&task.name[..task.name_len as usize])
+                    .unwrap_or("?")
+                    .into(),
+                state: task.state,
+                ticks: task.ticks,
+            })
+            .collect()
+    }
+
+    fn spawn_task(&mut self, name: &str) -> Result<u64, &'static str> {
+        spawn_named(name)
+    }
+
+    fn kill_task(&mut self, id: u64) -> Result<(), &'static str> {
+        vlr_sched::kill(id).map_err(|_| "kill failed")
     }
 }
 
