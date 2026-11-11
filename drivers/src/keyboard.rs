@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::instructions::port::Port;
 
 static SHIFT: AtomicBool = AtomicBool::new(false);
+static CTRL: AtomicBool = AtomicBool::new(false);
 static EXTENDED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
@@ -39,9 +40,14 @@ fn handle_scancode(scancode: u8) {
     match scancode {
         0x2A | 0x36 => SHIFT.store(true, Ordering::Relaxed),
         0xAA | 0xB6 => SHIFT.store(false, Ordering::Relaxed),
+        0x1D => CTRL.store(true, Ordering::Relaxed),
+        0x9D => CTRL.store(false, Ordering::Relaxed),
         released if released & 0x80 != 0 => {}
         pressed => {
-            if let Some(byte) = decode(pressed, SHIFT.load(Ordering::Relaxed)) {
+            if let Some(mut byte) = decode(pressed, SHIFT.load(Ordering::Relaxed)) {
+                if CTRL.load(Ordering::Relaxed) && byte.is_ascii_alphabetic() {
+                    byte = byte.to_ascii_lowercase() & 0x1f;
+                }
                 crate::input::push(byte);
             }
         }
