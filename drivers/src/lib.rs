@@ -11,15 +11,20 @@ pub mod display;
 pub mod input;
 pub mod keyboard;
 pub mod mouse;
+pub mod pci;
 pub mod ramdisk;
 pub mod rtc;
 pub mod serial;
 pub mod timer;
+pub mod usb_msc;
+pub mod xhci;
 
 mod font;
 
 pub fn with_root_disk<R>(f: impl FnOnce(&mut dyn block::BlockDevice) -> R) -> Result<R, block::BlockError> {
-    if ramdisk::active() {
+    if usb_msc::active() {
+        usb_msc::with_disk(|disk| f(disk))
+    } else if ramdisk::active() {
         ramdisk::with_disk(|disk| f(disk))
     } else {
         ata::with_disk(|disk| f(disk))

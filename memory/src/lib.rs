@@ -142,6 +142,10 @@ pub fn map_identity(phys: u64) -> Result<(), MapError> {
     paging::map_identity(phys)
 }
 
+pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MapError> {
+    paging::map_mmio(phys, len)
+}
+
 pub fn unmap_4k(virt: u64) -> Result<u64, MapError> {
     let phys = paging::unmap_4k(virt)?;
     // Кадр данных возвращается в пул. Кадры самих таблиц страниц остаются.

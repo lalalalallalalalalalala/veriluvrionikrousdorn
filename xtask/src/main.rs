@@ -63,6 +63,7 @@ fn run() -> Result<()> {
             persist_test()?;
             boot_test()?;
             shell_test()?;
+            usb_test()?;
             live_test()?;
             println!("vlr tests passed");
         }
@@ -148,6 +149,103 @@ fn make_live() -> Result<()> {
     println!("live bios: {}", bios.display());
     println!("live uefi: {}", uefi.display());
     Ok(())
+}
+
+fn usb_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
+    build_kernel(false)?;
+    make_image()?;
+    let stick = workspace_root().join("target/vlr-usb-root.img");
+    fs::copy(disk_path(), &stick)?;
+    run_usb_boot(&stick, true)?;
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly", stick.to_str().context("usb image")?])
+        .status()
+        .context("btrfs check usb")?;
+    if !check.success() {
+        bail!("btrfs check rejected the USB image after the write");
+    }
+    run_usb_boot(&stick, false)?;
+    println!("usb msc test passed");
+    Ok(())
+}
+
+fn run_usb_boot(stick: &std::path::Path, writing: bool) -> Result<()> {
+    let serial_port = 18781u16;
+    let monitor_port = 18782u16;
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-machine", "pc", "-accel", "tcg", "-cpu", "qemu64", "-smp", "1", "-m", "256M",
+            "-display", "none", "-no-reboot",
+            "-device", "qemu-xhci,id=xhci",
+        ])
+        .arg("-drive")
+        .arg(format!("format=raw,if=ide,index=0,file={}", image_path().display()))
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=stick,format=raw,cache=writethrough,file={}",
+            stick.display()
+        ))
+        .args(["-device", "usb-storage,bus=xhci.0,drive=stick"])
+        .arg("-serial")
+        .arg(format!("tcp:127.0.0.1:{serial_port},server"))
+        .arg("-monitor")
+        .arg(format!("tcp:127.0.0.1:{monitor_port},server,nowait"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("usb qemu")?;
+    let result = (|| {
+        let serial = connect_retry(("127.0.0.1", serial_port), Duration::from_secs(20))?;
+        let mut writer = serial.try_clone()?;
+        let captured = Arc::new(Mutex::new(String::new()));
+        let reader = Arc::clone(&captured);
+        thread::spawn(move || {
+            let mut serial = serial;
+            let mut buf = [0u8; 256];
+            loop {
+                match serial.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader
+                        .lock()
+                        .expect("serial")
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        for needle in ["usb-ok", "usb-root", "btrfs-ok", "user@::vch#~ "] {
+            if !wait_for(&captured, needle, Duration::from_secs(40)) {
+                bail!("usb boot missing '{needle}':\n{}", captured.lock().unwrap());
+            }
+        }
+        if writing {
+            writer.write_all(b"write /Users/user/usbkept usb-persist-ok\rcat /Users/user/usbkept\r")?;
+            writer.flush().ok();
+            if !wait_count(&captured, "usb-persist-ok", 2, Duration::from_secs(25)) {
+                bail!("usb write missing:\n{}", captured.lock().unwrap());
+            }
+        } else {
+            writer.write_all(b"cat /Users/user/usbkept\r")?;
+            writer.flush().ok();
+            if !wait_for(&captured, "usb-persist-ok", Duration::from_secs(40)) {
+                bail!("usb file did not survive reboot:\n{}", captured.lock().unwrap());
+            }
+        }
+        Ok(())
+    })();
+    if result.is_ok() {
+        if let Ok(mut monitor) = connect_retry(("127.0.0.1", monitor_port), Duration::from_secs(5)) {
+            let _ = write!(monitor, "quit\n");
+            let _ = monitor.flush();
+            let _ = child.wait();
+            return result;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn live_test() -> Result<()> {
@@ -327,7 +425,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 1.1.0",
+        "VLR kernel 1.2.0",
         "btrfs-ok",
         "motd-ok",
         "apps-ok",
@@ -589,7 +687,21 @@ fn shell_session() -> Result<()> {
         monitor.flush().ok();
         thread::sleep(Duration::from_millis(50));
     }
-    if !wait_for(&captured, "user@::vch#~ pwd", Duration::from_secs(5)) {
+    // greet ещё печатает и иногда вклинивается между приглашением и pwd.
+    let echo_deadline = Instant::now() + Duration::from_secs(5);
+    let mut echoed = false;
+    while Instant::now() < echo_deadline {
+        let text = captured.lock().expect("serial");
+        echoed = text.contains("user@::vch#~ pwd")
+            || text.contains("\npwd\n")
+            || text.contains("\npwd\r");
+        drop(text);
+        if echoed {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !echoed {
         bail!(
             "keyboard echo of pwd missing:\n{}",
             captured.lock().unwrap()

@@ -27,7 +27,7 @@ pub extern "C" fn _start() -> ! {
     let info = ShellInfo {
         username: name,
         os_name: "Veriluvrionikrousdorn",
-        os_version: "1.1.0",
+        os_version: "1.2.0",
         usable_memory: 0,
         home_display: "~",
         home_path: home,

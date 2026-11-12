@@ -346,6 +346,13 @@ fn mount_disk(boot_info: &'static mut BootInfo) {
             vlr_drivers::serial::write_str("live-ok\n");
         }
     }
+    if vlr_drivers::usb_msc::claim_root() {
+        match vlr_vfs::mount() {
+            Ok(()) => vlr_console::println!("btrfs-ok"),
+            Err(_) => vlr_console::println!("btrfs-failed"),
+        }
+        return;
+    }
     if vlr_drivers::ramdisk::active() {
         match vlr_vfs::mount() {
             Ok(()) => vlr_console::println!("btrfs-ok"),

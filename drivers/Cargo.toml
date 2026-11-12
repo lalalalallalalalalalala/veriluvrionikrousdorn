@@ -12,4 +12,5 @@ bench = false
 [dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 vlr-arch = { path = "../arch" }
+vlr-memory = { path = "../memory" }
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

@@ -78,6 +78,38 @@ pub fn map_identity(phys: u64) -> Result<(), MapError> {
     map_4k(phys, phys, true)
 }
 
+/// Отображает MMIO. Страницы уже попавшие в карту загрузчика не трогаем.
+pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MapError> {
+    let offset = phys_offset().ok_or(MapError::NotInitialized)?;
+    if len == 0 {
+        return Err(MapError::Misaligned);
+    }
+    let start = phys & !0xFFF;
+    let end = phys.saturating_add(len).saturating_add(0xFFF) & !0xFFF;
+    let mut addr = start;
+    while addr < end {
+        let virt = offset.wrapping_add(addr);
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+        let frame = PhysFrame::from_start_address(PhysAddr::new(addr)).map_err(|_| MapError::Misaligned)?;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE;
+        let mut slot = MAPPER.lock();
+        let mapper = slot.inner.as_mut().ok_or(MapError::NotInitialized)?;
+        let mut frames_slot = crate::frames();
+        let frames = frames_slot.as_mut().ok_or(MapError::NotInitialized)?;
+        match unsafe { mapper.map_to(page, frame, flags, frames) } {
+            Ok(flush) => flush.flush(),
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_))
+            | Err(x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage) => {}
+            Err(err) => return Err(map_err(err)),
+        }
+        addr = addr.saturating_add(PAGE_SIZE);
+    }
+    Ok(offset.wrapping_add(phys))
+}
+
 pub fn unmap_4k(virt: u64) -> Result<u64, MapError> {
     if virt % PAGE_SIZE != 0 {
         return Err(MapError::Misaligned);
