@@ -64,6 +64,7 @@ fn run() -> Result<()> {
             boot_test()?;
             shell_test()?;
             usb_test()?;
+            input_test()?;
             live_test()?;
             println!("vlr tests passed");
         }
@@ -248,6 +249,102 @@ fn run_usb_boot(stick: &std::path::Path, writing: bool) -> Result<()> {
     result
 }
 
+fn input_test() -> Result<()> {
+    build_userspace()?;
+    make_filesystem()?;
+    build_kernel(false)?;
+    make_image()?;
+    let serial_port = 18783u16;
+    let qmp_port = 18784u16;
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-machine", "pc", "-accel", "tcg", "-cpu", "qemu64", "-smp", "1", "-m", "256M",
+            "-display", "none", "-vga", "std", "-no-reboot",
+            "-device", "qemu-xhci,id=xhci",
+            "-device", "usb-kbd,id=kbd",
+            "-device", "usb-mouse,id=mouse",
+            "-device", "usb-tablet,id=tablet",
+        ])
+        .arg("-drive")
+        .arg(format!("format=raw,if=ide,index=0,file={}", image_path().display()))
+        .arg("-drive")
+        .arg(format!(
+            "format=raw,if=ide,index=1,cache=writethrough,file={}",
+            disk_path().display()
+        ))
+        .arg("-serial")
+        .arg(format!("tcp:127.0.0.1:{serial_port},server"))
+        .arg("-qmp")
+        .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("input qemu")?;
+    let result = (|| {
+        let serial = connect_retry(("127.0.0.1", serial_port), Duration::from_secs(20))?;
+        let mut writer = serial.try_clone()?;
+        let captured = Arc::new(Mutex::new(String::new()));
+        let reader = Arc::clone(&captured);
+        thread::spawn(move || {
+            let mut serial = serial;
+            let mut buf = [0u8; 256];
+            loop {
+                match serial.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader.lock().expect("serial").push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        if !wait_for(&captured, "user@::vch#~ ", Duration::from_secs(40)) {
+            bail!("input prompt missing:\n{}", captured.lock().unwrap());
+        }
+        writer.write_all(b"devices\rdisplay\r")?;
+        writer.flush().ok();
+        for needle in ["usb-keyboard", "usb-mouse", "usb-tablet", "bga-display", "mode "] {
+            if !wait_for(&captured, needle, Duration::from_secs(15)) {
+                bail!("input devices missing '{needle}':\n{}", captured.lock().unwrap());
+            }
+        }
+        let mut qmp = connect_retry(("127.0.0.1", qmp_port), Duration::from_secs(5))?;
+        let mut banner = [0u8; 256];
+        let _ = qmp.read(&mut banner);
+        qmp.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")?;
+        qmp.flush().ok();
+        thread::sleep(Duration::from_millis(100));
+        qmp.write_all(br#"{"execute":"input-send-event","arguments":{"events":[{"type":"abs","data":{"axis":"x","value":16384}},{"type":"abs","data":{"axis":"y","value":8192}}]}}"#)?;
+        qmp.write_all(b"\n")?;
+        qmp.flush().ok();
+        if !wait_for(&captured, "ptr ", Duration::from_secs(8)) {
+            bail!("tablet did not move the cursor:\n{}", captured.lock().unwrap());
+        }
+        qmp.write_all(br#"{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":true,"button":"wheel-up"}},{"type":"btn","data":{"down":false,"button":"wheel-up"}}]}}"#)?;
+        qmp.write_all(b"\n")?;
+        qmp.flush().ok();
+        if !wait_for(&captured, "scroll ", Duration::from_secs(8)) {
+            bail!("wheel did not scroll:\n{}", captured.lock().unwrap());
+        }
+        qmp.write_all(br#"{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"q"}}},{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"q"}}}]}}"#)?;
+        qmp.write_all(b"\n")?;
+        qmp.flush().ok();
+        if !wait_for(&captured, "hid-key q", Duration::from_secs(8)) {
+            bail!("usb key did not reach the desktop:\n{}", captured.lock().unwrap());
+        }
+        writer.write_all(b"display set 800 600\r")?;
+        writer.flush().ok();
+        if !wait_for(&captured, "mode 800x600", Duration::from_secs(8)) {
+            bail!("resolution change failed:\n{}", captured.lock().unwrap());
+        }
+        Ok(())
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    if result.is_ok() {
+        println!("input test passed");
+    }
+    result
+}
+
 fn live_test() -> Result<()> {
     build_userspace()?;
     make_filesystem()?;
@@ -425,7 +522,7 @@ fn boot_test() -> Result<()> {
     }
     for needle in [
         "Veriluvrionikrousdorn",
-        "VLR kernel 1.2.0",
+        "VLR kernel 1.3.0",
         "btrfs-ok",
         "motd-ok",
         "apps-ok",
