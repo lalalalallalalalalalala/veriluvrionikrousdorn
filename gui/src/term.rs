@@ -34,19 +34,30 @@ pub fn fingerprint() -> u64 {
 
 pub fn snapshot() -> alloc::string::String {
     vlr_arch::without_interrupts(|| unsafe {
-        let mut out = alloc::string::String::new();
+        let mut raw = alloc::vec::Vec::new();
         let mut tail = TAIL;
         while tail != HEAD {
             let byte = BUF[tail];
-            if byte == 0x0c {
-                out.clear();
-            } else if byte == 0x08 {
-                out.pop();
-            } else {
-                out.push(byte as char);
-            }
             tail = (tail + 1) % CAP;
+            if byte == 0x0c {
+                raw.clear();
+            } else if byte == 0x08 {
+                pop_utf8(&mut raw);
+            } else {
+                raw.push(byte);
+            }
         }
-        out
+        alloc::string::String::from_utf8_lossy(&raw).into_owned()
     })
+}
+
+fn pop_utf8(raw: &mut alloc::vec::Vec<u8>) {
+    loop {
+        let Some(byte) = raw.pop() else {
+            return;
+        };
+        if byte & 0xC0 != 0x80 {
+            return;
+        }
+    }
 }

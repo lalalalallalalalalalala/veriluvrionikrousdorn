@@ -291,9 +291,7 @@ pub fn snapshot() -> Vec<Info> {
             h: slot.h,
             z: slot.z,
             minimized: slot.minimized,
-            text: core::str::from_utf8(&slot.text[..slot.text_len])
-                .unwrap_or("")
-                .into(),
+            text: alloc::string::String::from_utf8_lossy(&slot.text[..slot.text_len]).into_owned(),
             focused: slot.id == table.focus,
         })
         .collect();
