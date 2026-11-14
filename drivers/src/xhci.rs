@@ -101,6 +101,8 @@ pub fn probe_msc() -> Result<Probe, &'static str> {
 }
 
 impl Host {
+    pub fn poll_hid(&mut self) {}
+
     fn start(virt: u64) -> Result<Self, &'static str> {
         let cap = virt as *mut u8;
         let caplen = unsafe { cap.read_volatile() } as usize;

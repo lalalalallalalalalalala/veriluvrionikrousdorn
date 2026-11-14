@@ -49,6 +49,14 @@ pub fn active() -> bool {
     DISK.lock().is_some()
 }
 
+pub fn poll_hid() {
+    interrupts::without_interrupts(|| {
+        if let Some(disk) = DISK.lock().as_mut() {
+            disk.host.poll_hid();
+        }
+    });
+}
+
 pub fn with_disk<R>(f: impl FnOnce(&mut dyn BlockDevice) -> R) -> Result<R, BlockError> {
     interrupts::without_interrupts(|| {
         let mut guard = DISK.lock();
