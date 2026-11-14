@@ -78,6 +78,13 @@ pub trait ShellIo {
         let _ = name;
         Err("failed")
     }
+    fn device_list(&mut self) -> Result<alloc::string::String, &'static str> {
+        Err("failed")
+    }
+    fn display_cmd(&mut self, arg: &str) -> Result<alloc::string::String, &'static str> {
+        let _ = arg;
+        Err("failed")
+    }
 }
 
 pub struct ShellInfo {
@@ -243,7 +250,9 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                  write    write text into a file\n  \
                  install  copy a .vlr into /Apps\n  \
                  uninstall remove an app from /Apps\n  \
-                 run      run a .vlr by name or path\n",
+                 run      run a .vlr by name or path\n  \
+                 devices  list input and display devices\n  \
+                 display  list or set a video mode\n",
             );
         }
         "clear" => io.clear(),
@@ -393,6 +402,14 @@ pub fn dispatch<I: ShellIo>(io: &mut I, info: &ShellInfo, line: &str, history: &
                 report(io, result);
             }
         }
+        "devices" => match io.device_list() {
+            Ok(text) => io.write_str(&text),
+            Err(err) => report(io, Err(err)),
+        },
+        "display" => match io.display_cmd(rest) {
+            Ok(text) => io.write_str(&text),
+            Err(err) => report(io, Err(err)),
+        },
         "install" => {
             let path = io_path(io, info, rest);
             let stem = path

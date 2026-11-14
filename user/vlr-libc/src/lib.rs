@@ -33,6 +33,8 @@ pub const SYS_WIN_TEXT: u64 = 24;
 pub const SYS_WIN_POLL: u64 = 25;
 pub const SYS_INSTALL: u64 = 26;
 pub const SYS_UNINSTALL: u64 = 27;
+pub const SYS_DEVICES: u64 = 28;
+pub const SYS_DISPLAY: u64 = 29;
 
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
@@ -182,6 +184,18 @@ pub fn uninstall(name: &str) -> i64 {
     syscall3(SYS_UNINSTALL, name.as_ptr() as u64, name.len() as u64, 0) as i64
 }
 
+pub fn devices(buf: &mut [u8]) -> i64 {
+    syscall3(SYS_DEVICES, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64
+}
+
+pub fn display_text(buf: &mut [u8]) -> i64 {
+    syscall3(SYS_DISPLAY, 0, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+pub fn display_set(width: u64, height: u64) -> i64 {
+    syscall3(SYS_DISPLAY, 1, width, height) as i64
+}
+
 pub fn close(fd: u64) -> i64 {
     syscall1(SYS_CLOSE, fd) as i64
 }
@@ -298,6 +312,8 @@ mod tests {
             SYS_WIN_POLL,
             SYS_INSTALL,
             SYS_UNINSTALL,
+            SYS_DEVICES,
+            SYS_DISPLAY,
         ];
         for (index, number) in nums.iter().enumerate() {
             assert_eq!(*number, (index as u64) + 1);

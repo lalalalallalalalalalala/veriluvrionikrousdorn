@@ -86,6 +86,15 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Клавиша из общей очереди событий попадает в окно, которое в фокусе.
+pub fn deliver_key(byte: u8) {
+    if terminal_focused() {
+        tty_push(byte);
+    } else {
+        push_key(focus_id(), byte);
+    }
+}
+
 pub fn tty_push(byte: u8) {
     let mut buf = TTY.lock();
     let head = TTY_HEAD.load(Ordering::Relaxed) as usize % buf.len();

@@ -36,7 +36,7 @@ const EMPTY: Event = Event::Key {
     text: [0; 4],
     text_len: 0,
 };
-const CAP: usize = 64;
+const CAP: usize = 256;
 
 struct Queue {
     buf: [Event; CAP],
@@ -95,7 +95,20 @@ pub fn pop_event() -> Option<Event> {
     })
 }
 
+static LAST_CR: AtomicBool = AtomicBool::new(false);
+
 pub fn push_byte(byte: u8) {
+    let byte = match byte {
+        b'\r' => {
+            LAST_CR.store(true, Ordering::Relaxed);
+            b'\n'
+        }
+        b'\n' if LAST_CR.swap(false, Ordering::Relaxed) => return,
+        other => {
+            LAST_CR.store(false, Ordering::Relaxed);
+            other
+        }
+    };
     push(Event::Key {
         down: true,
         usage: 0,

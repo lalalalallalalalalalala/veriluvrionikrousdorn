@@ -16,7 +16,7 @@ use vlr_libc::{
     FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_GETPID, SYS_GETTICKS, SYS_KILL,
     SYS_FSYNC, SYS_GETUSER, SYS_INSTALL, SYS_KSPAWN, SYS_MEMSTAT, SYS_MKDIR, SYS_OPEN, SYS_READ,
     SYS_READDIR,
-    SYS_RENAME, SYS_UNINSTALL, SYS_WIN_CLOSE, SYS_WIN_OPEN, SYS_WIN_POLL, SYS_WIN_TEXT,
+    SYS_DEVICES, SYS_DISPLAY, SYS_RENAME, SYS_UNINSTALL, SYS_WIN_CLOSE, SYS_WIN_OPEN, SYS_WIN_POLL, SYS_WIN_TEXT,
     SYS_SLEEP, SYS_TASKSTAT, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SYS_YIELD, O_APPEND, O_CREAT, O_RDWR,
     O_TRUNC, O_WRONLY, TaskRec, TwoPaths,
 };
@@ -103,6 +103,8 @@ fn dispatch(number: u64, a: u64, b: u64, c: u64) -> u64 {
         SYS_WIN_POLL => sys_win_poll(a),
         SYS_INSTALL => sys_install(a, b),
         SYS_UNINSTALL => sys_uninstall(a, b),
+        SYS_DEVICES => sys_devices(a, b),
+        SYS_DISPLAY => sys_display(a, b, c),
         _ => FAULT,
     }
 }
@@ -379,6 +381,29 @@ fn sys_uninstall(ptr: u64, len: u64) -> u64 {
         Ok(()) => 0,
         Err(_) => FAULT,
     }
+}
+
+fn sys_devices(ptr: u64, len: u64) -> u64 {
+    if !vlr_memory::is_user_range(ptr, len as usize) || len == 0 {
+        return FAULT;
+    }
+    let mut buf = [0u8; 256];
+    let n = vlr_drivers::devices::list_into(&mut buf).min(len as usize);
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, n) };
+    n as u64
+}
+
+fn sys_display(cmd: u64, b: u64, c: u64) -> u64 {
+    if cmd == 1 {
+        return if vlr_drivers::display::set_mode(b as u16, c as u16) { 0 } else { FAULT };
+    }
+    if !vlr_memory::is_user_range(b, c as usize) || c == 0 {
+        return FAULT;
+    }
+    let mut buf = [0u8; 160];
+    let n = vlr_drivers::display::describe(&mut buf).min(c as usize);
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), b as *mut u8, n) };
+    n as u64
 }
 
 fn sys_getuser(ptr: u64, len: u64) -> u64 {

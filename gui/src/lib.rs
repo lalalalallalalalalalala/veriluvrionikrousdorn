@@ -54,7 +54,7 @@ static mut DESK: Desk = Desk {
     windows: [
         Win { x: 70, y: 70, w: 620, h: 400, title: "vch", kind: 1, alive: true },
         Win { x: 740, y: 70, w: 280, h: 340, title: "Apps", kind: 2, alive: false },
-        Win { x: 0, y: 0, w: 0, h: 0, title: "", kind: 0, alive: false },
+        Win { x: 420, y: 430, w: 300, h: 200, title: "Settings", kind: 3, alive: false },
     ],
     drag: None,
     grab_x: 0,
@@ -125,6 +125,8 @@ pub fn desktop() -> ! {
     vlr_drivers::display::set_text_enabled(false);
     vlr_console::set_mirror(mirror);
     vlr_wm::set_active(true);
+    vlr_drivers::display::enable_flip();
+    load_settings();
     unsafe {
         if DESK.apps.is_empty() {
             if let Ok(names) = vlr_vfs::list_dir("/Apps") {
@@ -149,12 +151,12 @@ fn vlr_sched_sleep() {
 }
 
 fn frame(cursor: &mut (i32, i32)) {
-    let Some((width, height)) = vlr_drivers::display::size() else {
+    let Some((width, _height)) = vlr_drivers::display::size() else {
         return;
     };
-    vlr_drivers::mouse::clamp(width as i32, height as i32);
-    let mouse = vlr_drivers::mouse::state();
-    route_keys();
+    route_input();
+    let (mx, my, left) = vlr_drivers::event::cursor();
+    let mouse = vlr_drivers::mouse::Mouse { x: mx, y: my, left };
     wallpaper_rect(cursor.0, cursor.1, 16, 20);
     let mut extra = vlr_wm::focus_id();
     for info in vlr_wm::snapshot() {
@@ -204,6 +206,7 @@ fn frame(cursor: &mut (i32, i32)) {
     }
     draw_cursor(mouse.x, mouse.y);
     *cursor = (mouse.x, mouse.y);
+    vlr_drivers::display::present();
 }
 
 fn wallpaper_rect(x: i32, y: i32, w: i32, h: i32) {
@@ -240,6 +243,9 @@ fn click(x: i32, y: i32) {
                 NEED_WINDOWS.store(true, Ordering::Relaxed);
             } else if (248..320).contains(&x) {
                 lock_screen();
+            } else if (328..384).contains(&x) {
+                DESK.windows[2].alive = true;
+                NEED_WINDOWS.store(true, Ordering::Relaxed);
             }
             return;
         }
@@ -257,6 +263,25 @@ fn click(x: i32, y: i32) {
                 DESK.drag = Some(index);
                 DESK.grab_x = x - win.x;
                 DESK.grab_y = y - win.y;
+                return;
+            }
+            if win.kind == 3 {
+                let row = (y - win.y - TITLE_H as i32 - 8) / 28;
+                if row == 0 {
+                    vlr_drivers::settings::cycle_speed();
+                } else if row == 1 {
+                    vlr_drivers::layout::set_russian(!vlr_drivers::layout::is_russian());
+                } else if row == 2 {
+                    let (w, h) = vlr_drivers::display::size().unwrap_or((1280, 720));
+                    let modes = vlr_drivers::display::mode_list();
+                    let pos = modes.iter().position(|mode| *mode == (w as u16, h as u16)).unwrap_or(0);
+                    let next = modes[(pos + 1) % modes.len()];
+                    if vlr_drivers::display::set_mode(next.0, next.1) {
+                        paint_wallpaper_all();
+                    }
+                }
+                save_settings();
+                NEED_WINDOWS.store(true, Ordering::Relaxed);
                 return;
             }
             if win.kind == 2 {
@@ -314,6 +339,8 @@ fn draw_bar(width: usize) {
     text(180, 14, "Apps", 0x00FFFFFF, 0x00C4235A, 1);
     vlr_drivers::display::fill_rect(248, 8, 72, 24, 0x00601830);
     text(260, 14, "Lock", 0x00FFFFFF, 0x00601830, 1);
+    vlr_drivers::display::fill_rect(328, 8, 56, 24, 0x00601830);
+    text(336, 14, "Set", 0x00FFFFFF, 0x00601830, 1);
     let clock = vlr_drivers::rtc::read();
     let stamp = alloc::format!("{:02}:{:02}:{:02}", clock.hour, clock.minute, clock.second);
     text(width.saturating_sub(360).max(220), 12, &stamp, 0x00FFE4EE, BAR, 2);
@@ -336,6 +363,14 @@ fn draw_window(index: usize) {
     text(x + w - 20, y + 8, "x", TITLE, 0x00FFFFFF, 1);
     if win.kind == 1 {
         draw_terminal(x + 8, y + TITLE_H + 8, (w - 16) / 8, (h - TITLE_H - 16) / 8);
+    } else if win.kind == 3 {
+        let speed = alloc::format!("speed {}", vlr_drivers::settings::speed());
+        let layout = if vlr_drivers::layout::is_russian() { "layout ru" } else { "layout us" };
+        let (w, h) = vlr_drivers::display::size().unwrap_or((0, 0));
+        let mode = alloc::format!("mode {w}x{h}");
+        text(x + 12, y + TITLE_H + 16, &speed, INK, CARD, 2);
+        text(x + 12, y + TITLE_H + 48, layout, INK, CARD, 2);
+        text(x + 12, y + TITLE_H + 80, &mode, INK, CARD, 2);
     } else if win.kind == 2 {
         unsafe {
             for (row, name) in DESK.apps.iter().enumerate().take(10) {
@@ -410,32 +445,68 @@ fn paint_wallpaper_all() {
 
 fn text(x: usize, y: usize, message: &str, fg: u32, bg: u32, scale: usize) {
     let mut cursor = x;
-    for byte in message.bytes() {
-        if byte == b'\n' {
+    for ch in message.chars() {
+        if ch == '\n' {
             continue;
         }
-        vlr_drivers::display::glyph(cursor, y, byte, fg, bg, scale);
+        vlr_drivers::display::glyph_char(cursor, y, ch, fg, bg, scale);
         cursor += 8 * scale;
     }
 }
 
-fn route_keys() {
-    while let Some(byte) = vlr_drivers::input::pop() {
-        if byte == vlr_wm::CTRL_L {
-            lock_screen();
-            NEED_WINDOWS.store(true, Ordering::Relaxed);
-            paint_wallpaper_all();
+fn route_input() {
+    vlr_drivers::usb_hid::poll();
+    while let Some(event) = vlr_drivers::event::pop_event() {
+        vlr_drivers::event::apply(&event);
+        let vlr_drivers::event::Event::Key { down: true, text, text_len, .. } = event else {
             continue;
+        };
+        for index in 0..text_len as usize {
+            route_byte(text[index]);
         }
-        if byte == vlr_wm::CTRL_N {
-            let _ = vlr_wm::cycle();
-            continue;
-        }
-        if vlr_wm::terminal_focused() {
-            vlr_wm::tty_push(byte);
-        } else {
-            let id = vlr_wm::focus_id();
-            vlr_wm::push_key(id, byte);
+    }
+}
+
+fn route_byte(byte: u8) {
+    if byte == vlr_wm::CTRL_L {
+        lock_screen();
+        NEED_WINDOWS.store(true, Ordering::Relaxed);
+        paint_wallpaper_all();
+        return;
+    }
+    if byte == vlr_wm::CTRL_N {
+        let _ = vlr_wm::cycle();
+        return;
+    }
+    vlr_wm::deliver_key(byte);
+}
+
+fn save_settings() {
+    let _ = vlr_vfs::make_dir("/AppData/desktop");
+    let layout = if vlr_drivers::layout::is_russian() { "ru" } else { "us" };
+    let (w, h) = vlr_drivers::display::size().unwrap_or((0, 0));
+    let text = alloc::format!(
+        "speed={}\nlayout={layout}\nmode={w}x{h}\n",
+        vlr_drivers::settings::speed()
+    );
+    let _ = vlr_vfs::write_file("/AppData/desktop/settings", text.as_bytes());
+}
+
+fn load_settings() {
+    let Ok(bytes) = vlr_vfs::read_file("/AppData/desktop/settings") else {
+        return;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return;
+    };
+    vlr_drivers::settings::apply_text(text);
+    for line in text.split('\n') {
+        let Some(rest) = line.strip_prefix("mode=") else { continue };
+        let mut parts = rest.split('x');
+        let w = parts.next().unwrap_or("0").parse::<u16>().unwrap_or(0);
+        let h = parts.next().unwrap_or("0").parse::<u16>().unwrap_or(0);
+        if w > 0 && h > 0 {
+            let _ = vlr_drivers::display::set_mode(w, h);
         }
     }
 }

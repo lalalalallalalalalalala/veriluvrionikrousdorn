@@ -626,6 +626,28 @@ impl vch::ShellIo for KernelShell {
         vlr_syscall::uninstall_name(name)
     }
 
+    fn device_list(&mut self) -> Result<alloc::string::String, &'static str> {
+        let mut buf = [0u8; 256];
+        let n = vlr_drivers::devices::list_into(&mut buf);
+        Ok(alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
+    fn display_cmd(&mut self, arg: &str) -> Result<alloc::string::String, &'static str> {
+        if let Some(rest) = arg.strip_prefix("set") {
+            let mut parts = rest.split_whitespace();
+            let w = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            let h = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            return if vlr_drivers::display::set_mode(w, h) {
+                Ok(alloc::string::String::from("ok\n"))
+            } else {
+                Err("failed")
+            };
+        }
+        let mut buf = [0u8; 160];
+        let n = vlr_drivers::display::describe(&mut buf);
+        Ok(alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
     fn exec(&mut self, path: &str) -> Result<u64, &'static str> {
         match vlr_loader::exec_path(path) {
             Ok(id) => Ok(id),

@@ -27,7 +27,7 @@ pub extern "C" fn _start() -> ! {
     let info = ShellInfo {
         username: name,
         os_name: "Veriluvrionikrousdorn",
-        os_version: "1.2.0",
+        os_version: "1.3.0",
         usable_memory: 0,
         home_display: "~",
         home_path: home,
@@ -248,6 +248,26 @@ impl ShellIo for SysIo {
             0 => Ok(()),
             _ => Err("failed"),
         }
+    }
+
+    fn device_list(&mut self) -> Result<String, &'static str> {
+        let mut buf = [0u8; 256];
+        let n = vlr_libc::devices(&mut buf);
+        if n < 0 { return Err("failed"); }
+        Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+
+    fn display_cmd(&mut self, arg: &str) -> Result<String, &'static str> {
+        if let Some(rest) = arg.strip_prefix("set") {
+            let mut parts = rest.split_whitespace();
+            let w = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            let h = parts.next().unwrap_or("0").parse().unwrap_or(0);
+            return if vlr_libc::display_set(w, h) == 0 { Ok(String::from("ok\n")) } else { Err("failed") };
+        }
+        let mut buf = [0u8; 160];
+        let n = vlr_libc::display_text(&mut buf);
+        if n < 0 { return Err("failed"); }
+        Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
     }
 }
 
