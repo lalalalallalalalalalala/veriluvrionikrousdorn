@@ -6,6 +6,9 @@
 
 use core::sync::atomic::{fence, Ordering};
 
+use spin::Mutex;
+
+use super::hid::{self, Map};
 use super::pci;
 
 const TRBS: usize = 256;
@@ -34,6 +37,21 @@ struct Trb {
     control: u32,
 }
 
+struct HidDev {
+    live: bool,
+    slot: u8,
+    dci: u8,
+    mps: u16,
+    map: Map,
+    ring: Ring,
+    buf: Page,
+    prev: [u16; 6],
+    buttons: u8,
+    tip: bool,
+    last_x: i32,
+    last_y: i32,
+}
+
 pub struct Host {
     cap: *mut u8,
     op: usize,
@@ -42,8 +60,16 @@ pub struct Host {
     ports: u8,
     ctx: usize,
     slot: u8,
+    msc_slot: u8,
     in_dci: u8,
     out_dci: u8,
+    blocks: u64,
+    block_size: u32,
+    hid_n: u8,
+    hids: [Option<HidDev>; 3],
+    kept_out: [Option<Page>; 4],
+    kept_ep0: [Option<Ring>; 4],
+    kept_n: u8,
     cmd: Ring,
     ep0: Ring,
     bulk_in: Ring,
@@ -68,41 +94,61 @@ pub struct Probe {
     pub block_size: u32,
 }
 
+static EXTRA: Mutex<Option<Host>> = Mutex::new(None);
+
+pub fn poll_extra() {
+    if let Some(host) = EXTRA.lock().as_mut() {
+        host.poll_hid();
+    }
+}
+
 pub fn probe_msc() -> Result<Probe, &'static str> {
     let bar = pci::find_xhci()?;
     let mut host = Host::start(bar.virt)?;
     crate::serial::write_str("usb-host\n");
     host.power_ports();
     for port in 1..=host.ports {
-        if host.port_connected(port) {
-            if let Err(err) = host.try_port(port) {
+        if !host.port_connected(port) {
+            continue;
+        }
+        match host.open_port(port) {
+            Ok(true) => {
+                if host.blocks == 0 {
+                    if let Ok((blocks, block_size)) = host.capacity() {
+                        host.blocks = blocks;
+                        host.block_size = block_size;
+                        crate::serial::write_str("usb-msc\n");
+                    }
+                }
+                host.park()?;
+            }
+            Ok(false) => {
+                host.park()?;
+            }
+            Err(err) => {
                 crate::serial::write_str("usb-err ");
                 crate::serial::write_str(err);
                 crate::serial::write_str("\n");
-                continue;
             }
-        } else {
-            continue;
         }
-        crate::serial::write_str("usb-msc\n");
-        match host.capacity() {
-            Ok((blocks, block_size)) => {
-                return Ok(Probe {
-                    host,
-                    blocks,
-                    block_size,
-                });
-            }
-            Err(_) => continue,
-        }
+    }
+    if host.blocks > 0 {
+        let blocks = host.blocks;
+        let block_size = host.block_size;
+        return Ok(Probe {
+            host,
+            blocks,
+            block_size,
+        });
+    }
+    if host.hid_n > 0 {
+        *EXTRA.lock() = Some(host);
     }
     crate::serial::write_str("usb-skip\n");
     Err("no msc")
 }
 
 impl Host {
-    pub fn poll_hid(&mut self) {}
-
     fn start(virt: u64) -> Result<Self, &'static str> {
         let cap = virt as *mut u8;
         let caplen = unsafe { cap.read_volatile() } as usize;
@@ -155,8 +201,16 @@ impl Host {
             ports,
             ctx,
             slot: 0,
+            msc_slot: 0,
             in_dci: 0,
             out_dci: 0,
+            blocks: 0,
+            block_size: 0,
+            hid_n: 0,
+            hids: [None, None, None],
+            kept_out: [None, None, None, None],
+            kept_ep0: [None, None, None, None],
+            kept_n: 0,
             cmd: Ring::new(cmd_page),
             ep0: Ring::new(ep0),
             bulk_in: Ring::new(bulk_in),
@@ -206,7 +260,7 @@ impl Host {
         rd32(self.cap, self.portsc(port)) & 1 != 0
     }
 
-    fn try_port(&mut self, port: u8) -> Result<(), &'static str> {
+    fn open_port(&mut self, port: u8) -> Result<bool, &'static str> {
         let off = self.portsc(port);
         if rd32(self.cap, off) & 1 == 0 {
             return Err("empty");
@@ -219,8 +273,12 @@ impl Host {
         let speed = ((status >> 10) & 0xF) as u8;
         self.enable_slot()?;
         self.address(port, speed)?;
-        self.configure_msc()?;
-        Ok(())
+        if self.configure_msc().is_ok() {
+            self.msc_slot = self.slot;
+            return Ok(true);
+        }
+        self.setup_hid()?;
+        Ok(false)
     }
 
     fn reset_port(&mut self, port: u8) -> Result<(), &'static str> {
@@ -452,7 +510,7 @@ impl Host {
         fence(Ordering::SeqCst);
         self.bulk_out
             .push(self.bounce.phys, data.len() as u32, (1 << 10) | (1 << 5));
-        self.doorbell(self.slot, self.out_dci);
+        self.doorbell(self.bulk_slot(), self.out_dci);
         self.wait_transfer()
     }
 
@@ -462,7 +520,7 @@ impl Host {
         }
         self.bulk_in
             .push(self.bounce.phys, buf.len() as u32, (1 << 10) | (1 << 5));
-        self.doorbell(self.slot, self.in_dci);
+        self.doorbell(self.bulk_slot(), self.in_dci);
         self.wait_transfer()?;
         fence(Ordering::SeqCst);
         unsafe {
@@ -548,15 +606,35 @@ impl Host {
         self.wait_type(33)
     }
 
+    fn bulk_slot(&self) -> u8 {
+        if self.msc_slot == 0 { self.slot } else { self.msc_slot }
+    }
+
     fn wait_transfer(&mut self) -> Result<(), &'static str> {
-        self.wait_type(32)?;
-        if let Some(extra) = self.poll() {
-            let ty = (extra.control >> 10) & 0x3F;
-            if ty != 32 && ty != 34 {
-                return Err("extra");
+        for step in 0..4_000_000u32 {
+            if step % 256 == 0 {
+                let _ = rd32(self.cap, self.op + 4);
             }
+            let Some(ev) = self.poll() else {
+                core::hint::spin_loop();
+                continue;
+            };
+            let ty = (ev.control >> 10) & 0x3F;
+            if ty != 32 {
+                continue;
+            }
+            let code = (ev.status >> 24) & 0xFF;
+            if code != 1 && code != 13 {
+                return Err("code");
+            }
+            let ep = ((ev.control >> 16) & 0x1F) as u8;
+            if ep == 1 || ep == self.in_dci || ep == self.out_dci {
+                return Ok(());
+            }
+            let slot = ((ev.control >> 24) & 0xFF) as u8;
+            self.finish_hid(slot, ep);
         }
-        Ok(())
+        Err("timeout")
     }
 
     fn wait_type(&mut self, want: u32) -> Result<Event, &'static str> {
@@ -602,6 +680,279 @@ impl Host {
         let next = self.event_phys + self.ev_deq as u64 * 16;
         wr64(self.cap, self.rt + 0x38, next | 8);
         Some(Event { status, control })
+    }
+
+    fn setup_hid(&mut self) -> Result<(), &'static str> {
+        let mut head = [0u8; 9];
+        self.control(0x80, 6, 0x0200, 0, &mut head)?;
+        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+        if !(9..=512).contains(&total) {
+            return Err("cfg");
+        }
+        let mut cfg = [0u8; 512];
+        self.control(0x80, 6, 0x0200, 0, &mut cfg[..total])?;
+        let config_value = cfg[5];
+        let mut class = 0u8;
+        let mut iface = 0u8;
+        let mut report_len = 0usize;
+        let mut endpoint = None;
+        let mut at = 0usize;
+        while at + 2 <= total {
+            let len = cfg[at] as usize;
+            if len < 2 || at + len > total {
+                break;
+            }
+            match cfg[at + 1] {
+                4 if len >= 9 => {
+                    class = cfg[at + 5];
+                    iface = cfg[at + 2];
+                }
+                0x21 if len >= 9 && class == 3 => {
+                    report_len = u16::from_le_bytes([cfg[at + 7], cfg[at + 8]]) as usize;
+                }
+                5 if len >= 7 && class == 3 => {
+                    let addr = cfg[at + 2];
+                    let attr = cfg[at + 3] & 3;
+                    let mps = u16::from_le_bytes([cfg[at + 4], cfg[at + 5]]).max(1);
+                    if attr == 3 && addr & 0x80 != 0 {
+                        endpoint = Some((addr, mps));
+                    }
+                }
+                _ => {}
+            }
+            at += len;
+        }
+        if class != 3 {
+            return Err("not-hid");
+        }
+        let (addr, mps) = endpoint.ok_or("intr")?;
+        let report_len = report_len.clamp(8, 256);
+        let mut desc = [0u8; 256];
+        self.control(0x81, 6, 0x2200, u16::from(iface), &mut desc[..report_len])?;
+        let mut map = hid::parse(&desc[..report_len]);
+        let abs = map.fields[..map.n as usize].iter().any(|field| {
+            field.page == 0x01 && field.usage == 0x30 && !field.relative && !field.constant
+        });
+        if map.fields[..map.n as usize].iter().any(|field| field.page == 0x07 && field.array) {
+            map.kind = 1;
+        } else if abs {
+            map.kind = 3;
+        }
+        let _ = self.control(0x21, 0x0A, 0, u16::from(iface), &mut []);
+        let _ = self.control(0x21, 0x0B, 1, u16::from(iface), &mut []);
+        self.control(0x00, 9, u16::from(config_value), 0, &mut [])?;
+        if self.hid_n as usize >= self.hids.len() {
+            return Err("hids");
+        }
+        let dci = dci(addr);
+        let ring = Ring::new(dma_page()?);
+        let buf = dma_page()?;
+        zero(self.input.virt, 4096);
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.output.virt, self.input.virt.wrapping_add(self.ctx), 32);
+        }
+        let slot_ptr = self.input.virt.wrapping_add(self.ctx);
+        let dword0 = rd32(slot_ptr, 0);
+        wr32(slot_ptr, 0, (dword0 & !(0x1F << 27)) | (u32::from(dci) << 27));
+        wr32(self.input.virt, 4, 1 | (1 << dci));
+        let ep = self.input.virt.wrapping_add(self.ctx * (dci as usize + 1));
+        wr32(ep, 0, 4 << 16);
+        wr32(ep.wrapping_add(4), 0, (3 << 1) | (7 << 3) | (u32::from(mps) << 16));
+        wr64(ep.wrapping_add(8), 0, ring.phys | 1);
+        wr32(ep.wrapping_add(16), 0, u32::from(mps));
+        self.command(self.input.phys, 12, u32::from(self.slot))?;
+        let name = match map.kind {
+            1 => "usb-keyboard",
+            3 => "usb-tablet",
+            4 => "usb-touchpad",
+            5 => "usb-touchscreen",
+            _ => "usb-mouse",
+        };
+        crate::devices::add(name);
+        crate::serial::write_str(name);
+        crate::serial::write_str("\n");
+        let index = self.hid_n as usize;
+        self.hids[index] = Some(HidDev {
+            live: true,
+            slot: self.slot,
+            dci,
+            mps,
+            map,
+            ring,
+            buf,
+            prev: [0; 6],
+            buttons: 0,
+            tip: false,
+            last_x: 0,
+            last_y: 0,
+        });
+        self.hid_n += 1;
+        self.arm_hid(index);
+        Ok(())
+    }
+
+    fn arm_hid(&mut self, index: usize) {
+        let Some(dev) = self.hids[index].as_mut() else { return };
+        let len = u32::from(dev.mps.min(64));
+        let phys = dev.buf.phys;
+        let slot = dev.slot;
+        let dci = dev.dci;
+        dev.ring.push(phys, len, (1 << 10) | (1 << 5));
+        self.doorbell(slot, dci);
+    }
+
+    pub fn poll_hid(&mut self) {
+        while let Some(ev) = self.poll() {
+            let ty = (ev.control >> 10) & 0x3F;
+            if ty != 32 {
+                continue;
+            }
+            let code = (ev.status >> 24) & 0xFF;
+            if code != 1 && code != 13 {
+                continue;
+            }
+            let ep = ((ev.control >> 16) & 0x1F) as u8;
+            if ep == 1 || ep == self.in_dci || ep == self.out_dci {
+                continue;
+            }
+            let slot = ((ev.control >> 24) & 0xFF) as u8;
+            self.finish_hid(slot, ep);
+        }
+    }
+
+    fn finish_hid(&mut self, slot: u8, ep: u8) {
+        let index = self.hids.iter().position(|dev| {
+            dev.as_ref().is_some_and(|dev| dev.live && dev.slot == slot && dev.dci == ep)
+        });
+        let Some(index) = index else { return };
+        let mut data = [0u8; 64];
+        let n = {
+            let Some(dev) = self.hids[index].as_ref() else { return };
+            let n = usize::from(dev.mps.min(64));
+            unsafe { core::ptr::copy_nonoverlapping(dev.buf.virt, data.as_mut_ptr(), n) };
+            n
+        };
+        self.decode_hid(index, &data[..n]);
+        self.arm_hid(index);
+    }
+
+    fn decode_hid(&mut self, index: usize, data: &[u8]) {
+        let Some(dev) = self.hids[index].as_mut() else { return };
+        let map = dev.map;
+        let mut buttons = dev.buttons;
+        let mut dx = 0i32;
+        let mut dy = 0i32;
+        let mut ax = None;
+        let mut ay = None;
+        let mut wheel = 0i32;
+        let mut pressure = 0u32;
+        let mut keys = [0u16; 6];
+        let mut key_n = 0usize;
+        let mut contacts = 0i32;
+        for field in map.fields[..map.n as usize].iter() {
+            if field.constant {
+                continue;
+            }
+            for i in 0..field.count {
+                let bit = field.bit + u16::from(i) * u16::from(field.size);
+                let raw = hid::field_value(data, bit, field.size);
+                let value = hid::signed_value(raw, field.size, field.min);
+                let usage = if field.usage_max > field.usage { field.usage + u16::from(i) } else { field.usage };
+                if field.page == 0x07 && field.array && raw != 0 && key_n < keys.len() {
+                    keys[key_n] = raw as u16;
+                    key_n += 1;
+                } else if field.page == 0x07 && !field.array && field.usage >= 0xE0 {
+                    crate::layout::hid_usage(usage, raw != 0);
+                } else if field.page == 0x09 && !field.array {
+                    let mask = 1u8 << i.min(7);
+                    if raw != 0 { buttons |= mask; } else { buttons &= !mask; }
+                } else if field.page == 0x01 && (usage == 0x30 || field.usage == 0x30) {
+                    if field.relative { dx = dx.saturating_add(value); } else if ax.is_none() { ax = Some((value, field.max.max(1))); }
+                    else { contacts += 1; }
+                } else if field.page == 0x01 && (usage == 0x31 || field.usage == 0x31) {
+                    if field.relative { dy = dy.saturating_add(value); } else if ay.is_none() { ay = Some((value, field.max.max(1))); }
+                } else if field.page == 0x01 && usage == 0x38 {
+                    wheel = wheel.saturating_add(value);
+                } else if field.page == 0x0D && (usage == 0x30 || field.usage == 0x30) {
+                    pressure = raw;
+                } else if field.page == 0x0D && usage == 0x42 {
+                    if raw != 0 { buttons |= 1; }
+                }
+            }
+        }
+        if map.kind == 1 || map.fields[..map.n as usize].iter().any(|field| field.page == 0x07 && field.array) {
+            let prev = dev.prev;
+            for usage in prev {
+                if usage != 0 && !keys[..key_n].contains(&usage) {
+                    crate::layout::hid_usage(usage, false);
+                }
+            }
+            for usage in keys[..key_n].iter().copied() {
+                if usage != 0 && !prev.contains(&usage) {
+                    crate::layout::hid_usage(usage, true);
+                }
+            }
+            dev.prev = keys;
+        }
+        if buttons != dev.buttons {
+            let changed = buttons ^ dev.buttons;
+            for bit in 0..5u8 {
+                if changed & (1 << bit) != 0 {
+                    crate::event::push(crate::event::Event::Button { button: bit, down: buttons & (1 << bit) != 0 });
+                }
+            }
+            dev.buttons = buttons;
+        }
+        if dx != 0 || dy != 0 {
+            crate::event::push(crate::event::Event::PointerRel { dx: dx as i16, dy: dy as i16 });
+        }
+        if let (Some((x, xmax)), Some((y, ymax))) = (ax, ay) {
+            let (width, height) = crate::display::size().unwrap_or((1280, 720));
+            let sx = (x.max(0) as i64 * width as i64 / (xmax as i64 + 1)) as i32;
+            let sy = (y.max(0) as i64 * height as i64 / (ymax as i64 + 1)) as i32;
+            crate::event::push(crate::event::Event::PointerAbs { x: sx, y: sy });
+            if pressure > 0 || map.kind == 3 {
+                crate::event::push(crate::event::Event::Pen {
+                    x: sx, y: sy,
+                    pressure: pressure.min(u16::MAX as u32) as u16,
+                    tilt_x: 0, tilt_y: 0,
+                    down: pressure > 0 || buttons & 1 != 0,
+                });
+            }
+            if map.kind == 5 {
+                crate::event::push(crate::event::Event::Touch { id: 0, x: sx, y: sy, down: buttons & 1 != 0 });
+            }
+            if map.kind == 4 {
+                let moved = (sx - dev.last_x).abs() + (sy - dev.last_y).abs();
+                if contacts > 0 {
+                    crate::event::push(crate::event::Event::Scroll { dz: ((sy - dev.last_y) / 8) as i8 });
+                } else if dev.tip && buttons & 1 == 0 && moved < 12 {
+                    crate::event::push(crate::event::Event::Button { button: 0, down: true });
+                    crate::event::push(crate::event::Event::Button { button: 0, down: false });
+                }
+                dev.tip = buttons & 1 != 0;
+                dev.last_x = sx;
+                dev.last_y = sy;
+            }
+        }
+        if wheel != 0 {
+            crate::event::push(crate::event::Event::Scroll { dz: wheel as i8 });
+        }
+    }
+
+    fn park(&mut self) -> Result<(), &'static str> {
+        if self.kept_n as usize >= self.kept_out.len() {
+            return Err("kept");
+        }
+        let new_out = dma_page()?;
+        let new_ep0 = Ring::new(dma_page()?);
+        let old_out = core::mem::replace(&mut self.output, new_out);
+        let old_ep0 = core::mem::replace(&mut self.ep0, new_ep0);
+        let index = self.kept_n as usize;
+        self.kept_out[index] = Some(old_out);
+        self.kept_ep0[index] = Some(old_ep0);
+        self.kept_n += 1;
+        Ok(())
     }
 
     fn doorbell(&self, slot: u8, target: u8) {

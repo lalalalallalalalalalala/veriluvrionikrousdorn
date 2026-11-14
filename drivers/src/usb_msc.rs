@@ -53,7 +53,9 @@ pub fn poll_hid() {
     interrupts::without_interrupts(|| {
         if let Some(disk) = DISK.lock().as_mut() {
             disk.host.poll_hid();
+            return;
         }
+        xhci::poll_extra();
     });
 }
 
