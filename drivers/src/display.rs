@@ -448,6 +448,24 @@ pub fn set_mode(width: u16, height: u16) -> bool {
     true
 }
 
+/// Скопировать видимый кадр в задний буфер перед частичной перерисовкой.
+pub fn sync_back() {
+    if !FLIP.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut guard = lock_display();
+    let Some(display) = guard.as_mut() else { return };
+    let screen = display.stride.saturating_mul(display.height).saturating_mul(display.bytes_per_pixel);
+    if screen == 0 || display.len < screen.saturating_mul(2) {
+        return;
+    }
+    let back = display.draw_y.saturating_mul(display.stride).saturating_mul(display.bytes_per_pixel);
+    let front = if display.draw_y == 0 { screen } else { 0 };
+    unsafe {
+        core::ptr::copy_nonoverlapping(display.ptr.add(front), display.ptr.add(back), screen);
+    }
+}
+
 pub fn present() {
     if !FLIP.load(Ordering::Relaxed) {
         return;

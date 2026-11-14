@@ -157,7 +157,23 @@ fn frame(cursor: &mut (i32, i32)) {
     route_input();
     let (mx, my, left) = vlr_drivers::event::cursor();
     let mouse = vlr_drivers::mouse::Mouse { x: mx, y: my, left };
-    wallpaper_rect(cursor.0, cursor.1, 16, 20);
+    unsafe {
+        let pressed = mouse.left && !DESK.left;
+        DESK.left = mouse.left;
+        if pressed {
+            click(mouse.x, mouse.y);
+        }
+        if let Some(index) = DESK.drag {
+            if mouse.left {
+                let win = &mut DESK.windows[index];
+                remember_wallpaper(win.x, win.y, win.w, win.h);
+                win.x = (mouse.x - DESK.grab_x).max(0);
+                win.y = (mouse.y - DESK.grab_y).max(BAR_H as i32);
+            } else {
+                DESK.drag = None;
+            }
+        }
+    }
     let mut extra = vlr_wm::focus_id();
     for info in vlr_wm::snapshot() {
         extra = extra.wrapping_add(info.text.len() as u64).wrapping_add(info.w as u64);
@@ -168,23 +184,13 @@ fn frame(cursor: &mut (i32, i32)) {
     let dragging = unsafe { DESK.drag.is_some() };
     let redraw_windows = mark != LAST_MARK.load(Ordering::Relaxed) || dragging || NEED_WINDOWS.load(Ordering::Relaxed);
     LAST_MARK.store(mark, Ordering::Relaxed);
-    unsafe {
-        let pressed = mouse.left && !DESK.left;
-        DESK.left = mouse.left;
-        if pressed {
-            click(mouse.x, mouse.y);
-        }
-        if let Some(index) = DESK.drag {
-            if mouse.left {
-                let win = &mut DESK.windows[index];
-                wallpaper_rect(win.x, win.y, win.w, win.h);
-                win.x = (mouse.x - DESK.grab_x).max(0);
-                win.y = (mouse.y - DESK.grab_y).max(BAR_H as i32);
-            } else {
-                DESK.drag = None;
-            }
-        }
+    let cursor_moved = *cursor != (mouse.x, mouse.y);
+    if !redraw_windows && !cursor_moved && stamp == LAST_STAMP.load(Ordering::Relaxed) {
+        return;
     }
+    vlr_drivers::display::sync_back();
+    flush_wallpaper();
+    wallpaper_rect(cursor.0, cursor.1, 16, 20);
     if stamp != LAST_STAMP.load(Ordering::Relaxed) || redraw_windows {
         draw_bar(width);
         LAST_STAMP.store(stamp, Ordering::Relaxed);
@@ -207,6 +213,28 @@ fn frame(cursor: &mut (i32, i32)) {
     draw_cursor(mouse.x, mouse.y);
     *cursor = (mouse.x, mouse.y);
     vlr_drivers::display::present();
+}
+
+static mut ERASES: [(i32, i32, i32, i32); 8] = [(0, 0, 0, 0); 8];
+static mut ERASE_N: usize = 0;
+
+fn remember_wallpaper(x: i32, y: i32, w: i32, h: i32) {
+    unsafe {
+        if ERASE_N < ERASES.len() {
+            ERASES[ERASE_N] = (x, y, w, h);
+            ERASE_N += 1;
+        }
+    }
+}
+
+fn flush_wallpaper() {
+    unsafe {
+        for index in 0..ERASE_N {
+            let (x, y, w, h) = ERASES[index];
+            wallpaper_rect(x, y, w, h);
+        }
+        ERASE_N = 0;
+    }
 }
 
 fn wallpaper_rect(x: i32, y: i32, w: i32, h: i32) {
@@ -255,7 +283,7 @@ fn click(x: i32, y: i32) {
                 continue;
             }
             if x >= win.x + win.w - 26 && y < win.y + TITLE_H as i32 {
-                wallpaper_rect(win.x, win.y, win.w, win.h);
+                remember_wallpaper(win.x, win.y, win.w, win.h);
                 DESK.windows[index].alive = false;
                 return;
             }
@@ -555,12 +583,12 @@ fn hit_clients(x: i32, y: i32) -> bool {
         }
         if x >= info.x + info.w - 26 && y < info.y + TITLE_H as i32 {
             vlr_wm::close(info.id);
-            wallpaper_rect(info.x, info.y, info.w, info.h);
+            remember_wallpaper(info.x, info.y, info.w, info.h);
             return true;
         }
         if x >= info.x + info.w - 48 && y < info.y + TITLE_H as i32 {
             vlr_wm::minimize(info.id);
-            wallpaper_rect(info.x, info.y, info.w, info.h);
+            remember_wallpaper(info.x, info.y, info.w, info.h);
             return true;
         }
         if x >= info.x + info.w - 16 && y >= info.y + info.h - 16 {
