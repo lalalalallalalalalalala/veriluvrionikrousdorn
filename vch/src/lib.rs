@@ -191,6 +191,9 @@ pub fn format_prompt(username: &str, cwd: &str, out: &mut [u8]) -> usize {
 
 pub fn read_line<I: ShellIo>(io: &mut I) -> String {
     let mut line = String::new();
+    let mut seq = [0u8; 4];
+    let mut filled = 0usize;
+    let mut need = 0usize;
     loop {
         match io.read_byte() {
             b'\n' | b'\r' => {
@@ -198,19 +201,44 @@ pub fn read_line<I: ShellIo>(io: &mut I) -> String {
                 return line;
             }
             0x08 | 0x7F => {
+                filled = 0;
+                need = 0;
                 if line.pop().is_some() {
                     io.backspace();
                 }
             }
-            byte if (0x20..0x7F).contains(&byte) => {
-                if line.len() < 1024 {
-                    line.push(byte as char);
-                    let text = [byte];
-                    io.write_str(core::str::from_utf8(&text).unwrap_or(""));
+            byte if byte >= 0x20 => {
+                if need == 0 {
+                    need = utf8_width(byte);
+                    filled = 0;
+                }
+                if filled < seq.len() {
+                    seq[filled] = byte;
+                    filled += 1;
+                }
+                if filled >= need {
+                    if let Ok(text) = core::str::from_utf8(&seq[..filled]) {
+                        if line.len() + text.len() <= 1024 {
+                            line.push_str(text);
+                            io.write_str(text);
+                        }
+                    }
+                    filled = 0;
+                    need = 0;
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn utf8_width(byte: u8) -> usize {
+    match byte {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 1,
     }
 }
 
@@ -818,6 +846,14 @@ mod tests {
         let line = read_line(&mut io);
         assert_eq!(line, "help");
         assert_eq!(io.out, "help\n");
+    }
+
+    #[test]
+    fn line_keeps_cyrillic_utf8() {
+        let mut io = io(b"\xd0\xb9\xd1\x86\xd1\x83\n");
+        let line = read_line(&mut io);
+        assert_eq!(line, "йцу");
+        assert_eq!(io.out, "йцу\n");
     }
 
     #[test]
