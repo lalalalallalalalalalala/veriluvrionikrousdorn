@@ -330,7 +330,8 @@ fn input_test() -> Result<()> {
         if !wait_for(&captured, "hid-key q", Duration::from_secs(8)) {
             bail!("usb key did not reach the desktop:\n{}", captured.lock().unwrap());
         }
-        writer.write_all(b"display set 800 600\r")?;
+        // q попала в строку терминала. Закрыть её, потом сменить режим.
+        writer.write_all(b"\rdisplay set 800 600\r")?;
         writer.flush().ok();
         if !wait_for(&captured, "mode 800x600", Duration::from_secs(8)) {
             bail!("resolution change failed:\n{}", captured.lock().unwrap());
