@@ -91,11 +91,14 @@ pub fn parse(desc: &[u8]) -> Map {
                     _ => map.kind,
                 };
             }
-            (0, 0) | (0, 1) => {
-                usage = raw as u16;
-                usage_max = usage_max.max(usage);
+            (2, 0) | (2, 1) => {
+                let u = raw as u16;
+                if usage == 0 {
+                    usage = u;
+                }
+                usage_max = usage_max.max(u);
             }
-            (0, 2) => usage_max = raw as u16,
+            (2, 2) => usage_max = raw as u16,
             (1, 5) => min = signed,
             (1, 9) => max = signed,
             (1, 7) => size = raw as u8,
@@ -119,6 +122,8 @@ pub fn parse(desc: &[u8]) -> Map {
                     map.n += 1;
                 }
                 bit = bit.saturating_add(u16::from(size) * u16::from(count));
+                usage = 0;
+                usage_max = 0;
             }
             _ => {}
         }
