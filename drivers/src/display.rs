@@ -360,13 +360,24 @@ impl Display {
             (red, green, blue)
         };
         unsafe {
-            let pixel = self.ptr.add(offset);
-            pixel.write_volatile(p0);
-            pixel.add(1).write_volatile(p1);
-            pixel.add(2).write_volatile(p2);
-            if self.bytes_per_pixel > 3 {
-                pixel.add(3).write_volatile(0);
+            self.store_pixel(offset, p0, p1, p2);
+            if FLIP.load(Ordering::Relaxed) && self.height > 0 {
+                let alt_y = if self.draw_y == 0 { y + self.height } else { y - self.height };
+                let alt = (alt_y * self.stride + x) * self.bytes_per_pixel;
+                if alt + self.bytes_per_pixel <= self.len {
+                    self.store_pixel(alt, p0, p1, p2);
+                }
             }
+        }
+    }
+
+    unsafe fn store_pixel(&self, offset: usize, p0: u8, p1: u8, p2: u8) {
+        let pixel = self.ptr.add(offset);
+        pixel.write_volatile(p0);
+        pixel.add(1).write_volatile(p1);
+        pixel.add(2).write_volatile(p2);
+        if self.bytes_per_pixel > 3 {
+            pixel.add(3).write_volatile(0);
         }
     }
 }
@@ -446,24 +457,6 @@ pub fn set_mode(width: u16, height: u16) -> bool {
     crate::serial::write_str(label);
     crate::serial::write_str("\n");
     true
-}
-
-/// Скопировать видимый кадр в задний буфер перед частичной перерисовкой.
-pub fn sync_back() {
-    if !FLIP.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut guard = lock_display();
-    let Some(display) = guard.as_mut() else { return };
-    let screen = display.stride.saturating_mul(display.height).saturating_mul(display.bytes_per_pixel);
-    if screen == 0 || display.len < screen.saturating_mul(2) {
-        return;
-    }
-    let back = display.draw_y.saturating_mul(display.stride).saturating_mul(display.bytes_per_pixel);
-    let front = if display.draw_y == 0 { screen } else { 0 };
-    unsafe {
-        core::ptr::copy_nonoverlapping(display.ptr.add(front), display.ptr.add(back), screen);
-    }
 }
 
 pub fn present() {
